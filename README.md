@@ -4,7 +4,7 @@
 
 [![Lisans](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
-[![Sürüm](https://img.shields.io/github/v/release/KULLANICI_ADI/Miflon)](https://github.com/KULLANICI_ADI/Miflon/releases) <!-- KULLANICI_ADI'NI DEĞİŞTİRİN -->
+[![Sürüm](https://img.shields.io/github/v/release/stilkod/Miflon)](https://github.com/stilkod/Miflon/releases) <!-- KULLANICI_ADI'NI DEĞİŞTİRİN -->
 
 **Miflon, görsellerinizdeki hassas verileri kolayca gizlemek, kırpmak ve yeniden boyutlandırmak için tasarlanmış, hızlı ve güçlü bir masaüstü aracıdır.**
 
