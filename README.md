@@ -1,7 +1,5 @@
 # Miflon
 
-![Miflon Uygulama Banner'ı](assets/miflon-banner.png) <!-- İSTEĞE BAĞLI: PROJENİZ İÇİN OLUŞTURDUĞUNUZ BİR BANNER -->
-
 [![Lisans](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
 [![Sürüm](https://img.shields.io/github/v/release/stilkod/Miflon)](https://github.com/stilkod/Miflon/releases)
