@@ -317,17 +317,28 @@ class ImageToolApp:
                 self.btn_undo.config(state="disabled")
 
     def open_image(self):
-        filepath = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
-        if not filepath: return
-        self.cv_image = cv2.imread(filepath)
-        if self.cv_image is None:
-            messagebox.showerror("Hata", "Geçerli bir resim dosyası açılamadı.")
-            return
+    filepath = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
+    if not filepath: return
+    
+    try:
+        # PIL ile okuma deneyin (daha çok dosya formatını destekler)
+        pil_image = Image.open(filepath)
+        img_array = np.array(pil_image)
+        
+        # RGB ise BGR'ye dönüştürün (OpenCV için)
+        if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+            self.cv_image = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        else:
+            # Gri tonlamalı veya RGBA için
+            self.cv_image = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            
         self.history = []
         self.current_step = -1
         self.add_to_history(self.cv_image.copy())
         self.update_display_image()
         self.btn_save.config(state="normal")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Resim açılırken hata oluştu: {str(e)}")
         
     def on_window_resize(self, event=None):
         if self.cv_image is not None:
