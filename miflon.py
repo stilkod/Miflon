@@ -3,6 +3,7 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
+import os
 
 # ==============================================================================
 # BÖLÜM 1: KAYDETME, KIRPMA VE YENİDEN BOYUTLANDIRMA DİYALOG PENCERESİ
@@ -36,9 +37,9 @@ class SaveOptionsDialog:
         # --- Sol Panel (Ayarlar) ---
         self.crop_frame = tk.LabelFrame(left_panel, text="1. Kırpma Oranı Seç", padx=10, pady=10)
         self.crop_frame.pack(fill="x", pady=(0, 10))
-        self.crop_var = tk.StringVar(value="original")
+        self.crop_var = tk.StringVar(value="16:9")
         crop_ratios = {
-            "Kırpma Yok (Orijinal)": "original", "Manşet (21:9)": "21:9",
+            "Kırpma Yok (Orjinal)": "original", "Manşet (21:9)": "21:9",
             "Galeri (16:9)": "16:9", "Klasik (4:3)": "4:3", "Kare (1:1)": "1:1"
         }
         for text, value in crop_ratios.items():
@@ -139,7 +140,7 @@ class SaveOptionsDialog:
         
         aspect_ratio = w / h
         
-        sizes = {"Orijinal": "original"}
+        sizes = {"Orjinal": "original"}
         if w > 854: sizes[f"Küçük ({854}x{int(854/aspect_ratio)})"] = "small"
         if w > 1280: sizes[f"Orta ({1280}x{int(1280/aspect_ratio)})"] = "medium"
         if w > 1920: sizes[f"Büyük ({1920}x{int(1920/aspect_ratio)})"] = "large"
@@ -205,7 +206,11 @@ class SaveOptionsDialog:
             elif size_mode == "custom":
                 try:
                     target_w = int(self.width_entry.get())
-                    target_h = int(self.height_entry.get())
+                    h_entry = self.height_entry.get()
+                    if h_entry.strip() == "":
+                        target_h = int(target_w / aspect_ratio)
+                    else:
+                        target_h = int(h_entry)
                 except ValueError:
                     messagebox.showerror("Hata", "Özel boyut için geçerli sayılar girin.", parent=self.top)
                     return
@@ -215,11 +220,45 @@ class SaveOptionsDialog:
 
             final_image = cv2.resize(final_image, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".jpg", initialfile="islenmis_gorsel.jpg",
+        # Dosya kaydetme diyaloğu
+        original_filepath = filedialog.asksaveasfilename(
             filetypes=[("JPG file", "*.jpg"), ("PNG file", "*.png"), ("BMP file", "*.bmp")]
         )
-        if not filepath: return
+        if not original_filepath: return
+        
+        directory = os.path.dirname(original_filepath)
+        filename = os.path.splitext(os.path.basename(original_filepath))[0]
+        ext = os.path.splitext(original_filepath)[1].lower()
+
+        # Eğer uzantı yoksa veya yanlışsa, .jpg ekle
+        if ext not in [".jpg", ".jpeg", ".png", ".bmp"]:
+            ext = ".jpg"
+            original_filepath += ext
+
+        # Add modifications to filename
+        modifications = []
+        # Create a mapping for crop ratio names
+        crop_names = {
+            "21:9": "manset",
+            "16:9": "galeri", 
+            "4:3": "klasik",
+            "1:1": "kare"
+        }
+
+        if self.crop_var.get() != "original":
+            crop_name = crop_names.get(self.crop_var.get(), self.crop_var.get())
+            modifications.append(crop_name)
+
+        if self.size_var.get() != "original":
+            modifications.append(self.size_var.get())
+
+        # Create new filename with modifications
+        new_filename = filename
+        if modifications:
+            new_filename += "_" + "_".join(modifications)
+        
+        # Complete filepath
+        filepath = os.path.join(directory, new_filename + ext)
         
         try:
             if filepath.lower().endswith(('.jpg', '.jpeg')):
@@ -316,27 +355,33 @@ class ImageToolApp:
             if self.current_step == 0:
                 self.btn_undo.config(state="disabled")
 
+    def update_window_title(self, filepath=None):
+        if filepath:
+            filename = os.path.basename(filepath)
+            self.root.title(f"{filename} - Miflon - Görsel Araç Seti")
+        else:
+            self.root.title("Miflon - Görsel Araç Seti")
+
     def open_image(self):
         filepath = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
         if not filepath: return
         
         try:
-            # PIL ile okuma deneyin (daha çok dosya formatını destekler)
             pil_image = Image.open(filepath)
             img_array = np.array(pil_image)
-            
-            # RGB ise BGR'ye dönüştürün (OpenCV için)
-            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                self.cv_image = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            if len(img_array.shape) == 2:
+                self.cv_image = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+            elif img_array.shape[2] == 4:
+                self.cv_image = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
             else:
-                # Gri tonlamalı veya RGBA için
                 self.cv_image = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                
+            self.update_window_title(filepath)
             self.history = []
             self.current_step = -1
             self.add_to_history(self.cv_image.copy())
             self.update_display_image()
             self.btn_save.config(state="normal")
+            self.btn_undo.config(state="disabled")
         except Exception as e:
             messagebox.showerror("Hata", f"Resim açılırken hata oluştu: {str(e)}")
         
@@ -345,11 +390,15 @@ class ImageToolApp:
             self.update_display_image()
             
     def update_display_image(self):
+        if self.cv_image is None:
+            return
         image_rgb = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
         
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
+        if canvas_width < 10 or canvas_height < 10:
+            return
         
         img_ratio = pil_image.width / pil_image.height
         canvas_ratio = canvas_width / canvas_height
@@ -391,7 +440,9 @@ class ImageToolApp:
     def apply_pixelate(self, img, pixel_size):
         h, w = img.shape[:2]
         if w < pixel_size or h < pixel_size: return img
-        temp = cv2.resize(img, (w // pixel_size, h // pixel_size), interpolation=cv2.INTER_LINEAR)
+        new_w = max(1, w // pixel_size)
+        new_h = max(1, h // pixel_size)
+        temp = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         return cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
 
     def apply_effect_to_selection(self, start_x, start_y, end_x, end_y):
