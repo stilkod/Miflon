@@ -61,7 +61,7 @@ Projeye katkıda bulunmak veya kodu kendiniz çalıştırmak isterseniz:
 
 4.  **Uygulamayı çalıştırın:**
     ```bash
-    python gorsel_arac_kiti.py
+    python miflon.py
     ```
 
 ## 🛠️ Teknoloji Yığını
