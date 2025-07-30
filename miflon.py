@@ -1,14 +1,16 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox, colorchooser
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import cv2
 import numpy as np
 import os
 
 # ==============================================================================
 # BÖLÜM 1: KAYDETME, KIRPMA VE YENİDEN BOYUTLANDIRMA DİYALOG PENCERESİ
+# (Bu bölümde değişiklik yok)
 # ==============================================================================
 class SaveOptionsDialog:
+    # ... Bu sınıfın kodu olduğu gibi kalacak ...
     def __init__(self, parent, image_to_save):
         self.top = tk.Toplevel(parent)
         self.top.title("Kaydet, Kırp ve Yeniden Boyutlandır")
@@ -230,19 +232,14 @@ class SaveOptionsDialog:
         filename = os.path.splitext(os.path.basename(original_filepath))[0]
         ext = os.path.splitext(original_filepath)[1].lower()
 
-        # Eğer uzantı yoksa veya yanlışsa, .jpg ekle
         if ext not in [".jpg", ".jpeg", ".png", ".bmp"]:
             ext = ".jpg"
             original_filepath += ext
 
-        # Add modifications to filename
         modifications = []
-        # Create a mapping for crop ratio names
         crop_names = {
-            "21:9": "manset",
-            "16:9": "galeri", 
-            "4:3": "klasik",
-            "1:1": "kare"
+            "21:9": "manset", "16:9": "galeri", 
+            "4:3": "klasik", "1:1": "kare"
         }
 
         if self.crop_var.get() != "original":
@@ -252,12 +249,10 @@ class SaveOptionsDialog:
         if self.size_var.get() != "original":
             modifications.append(self.size_var.get())
 
-        # Create new filename with modifications
         new_filename = filename
         if modifications:
             new_filename += "_" + "_".join(modifications)
         
-        # Complete filepath
         filepath = os.path.join(directory, new_filename + ext)
         
         try:
@@ -266,15 +261,214 @@ class SaveOptionsDialog:
             else:
                 cv2.imwrite(filepath, final_image)
             
-            # #!#!# DÜZELTME BURADA YAPILDI #!#!#
-            # Dosya yolunu, kullanıcıya göstermeden önce işletim sistemine uygun standart hale getiriyoruz.
             gosterilecek_yol = os.path.normpath(filepath)
-            
             messagebox.showinfo("Başarılı", f"Fotoğraf başarıyla kaydedildi:\n{gosterilecek_yol}", parent=self.top)
             self.top.destroy()
             
         except Exception as e:
             messagebox.showerror("Kaydetme Hatası", f"Bir hata oluştu: {e}", parent=self.top)
+
+
+# ==============================================================================
+# BÖLÜM 1.5: YENİ EKLENEN BÖLÜM - FİLİGRAN EKLEME DİYALOG PENCERESİ
+# ==============================================================================
+class WatermarkDialog:
+    def __init__(self, parent, cv_image):
+        self.top = tk.Toplevel(parent)
+        self.top.title("Filigran Ekle")
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        # Ana uygulama OpenCV BGR formatında çalışıyor. Pillow ile çalışmak için RGBA'ya çevirelim.
+        self.base_image_pil = Image.fromarray(cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGBA))
+        self.result_image = None  # Sonuç bu değişkende tutulacak
+
+        # --- Arayüz Elemanları ---
+        main_frame = tk.Frame(self.top, padx=15, pady=15)
+        main_frame.pack(expand=True, fill="both")
+
+        # --- Filigran Türü Seçimi ---
+        self.watermark_type = tk.StringVar(value="text")
+        type_frame = tk.LabelFrame(main_frame, text="1. Filigran Türü", padx=10, pady=10)
+        type_frame.pack(fill="x", pady=(0, 10))
+        tk.Radiobutton(type_frame, text="Metin Filigranı", variable=self.watermark_type, value="text", command=self.toggle_options).pack(anchor="w")
+        tk.Radiobutton(type_frame, text="Logo (Resim) Filigranı", variable=self.watermark_type, value="logo", command=self.toggle_options).pack(anchor="w")
+
+        # --- Metin Ayarları ---
+        self.text_frame = tk.LabelFrame(main_frame, text="2. Metin Ayarları", padx=10, pady=10)
+        self.text_frame.pack(fill="x", pady=5)
+        
+        tk.Label(self.text_frame, text="Metin:").grid(row=0, column=0, sticky="w", pady=2)
+        self.text_entry = tk.Entry(self.text_frame, width=30)
+        self.text_entry.grid(row=0, column=1, columnspan=2, sticky="ew")
+        self.text_entry.insert(0, "* KVKK gereği bazı yüzler bulanıklaştırılmıştır.")
+
+        tk.Label(self.text_frame, text="Yazı Boyutu:").grid(row=1, column=0, sticky="w", pady=2)
+        self.font_size_entry = tk.Entry(self.text_frame, width=5)
+        self.font_size_entry.grid(row=1, column=1, sticky="w")
+        self.font_size_entry.insert(0, "12")
+
+        tk.Label(self.text_frame, text="Renk:").grid(row=2, column=0, sticky="w", pady=2)
+        self.color_button = tk.Button(self.text_frame, text="Renk Seç", command=self.choose_color)
+        self.color_button.grid(row=2, column=1, sticky="w")
+        self.text_color = (255, 255, 255) # Varsayılan Beyaz
+
+        # --- Logo Ayarları ---
+        self.logo_frame = tk.LabelFrame(main_frame, text="2. Logo Ayarları", padx=10, pady=10)
+        # pack() çağrısı toggle_options içinde yapılacak
+
+        self.logo_path_var = tk.StringVar()
+        tk.Label(self.logo_frame, text="Logo Dosyası:").grid(row=0, column=0, sticky="w")
+        tk.Entry(self.logo_frame, textvariable=self.logo_path_var, state="readonly", width=30).grid(row=0, column=1, sticky="ew")
+        tk.Button(self.logo_frame, text="...", command=self.browse_logo).grid(row=0, column=2, padx=5)
+
+        tk.Label(self.logo_frame, text="Boyut (%):").grid(row=1, column=0, sticky="w", pady=5)
+        self.logo_size_scale = tk.Scale(self.logo_frame, from_=1, to=100, orient="horizontal", length=200)
+        self.logo_size_scale.set(10)
+        self.logo_size_scale.grid(row=1, column=1, columnspan=2, sticky="ew")
+        
+        # --- Ortak Ayarlar (Konum ve Şeffaflık) ---
+        common_frame = tk.LabelFrame(main_frame, text="3. Ortak Ayarlar", padx=10, pady=10)
+        common_frame.pack(fill="x", pady=5)
+
+        tk.Label(common_frame, text="Konum:").grid(row=0, column=0, sticky="w")
+        self.position_var = tk.StringVar(value="bottom_right")
+        positions = {"Sağ Alt": "bottom_right", "Sol Alt": "bottom_left", "Sağ Üst": "top_right", "Sol Üst": "top_left", "Orta": "center"}
+        pos_col = 1
+        for text, value in positions.items():
+            tk.Radiobutton(common_frame, text=text, variable=self.position_var, value=value).grid(row=0, column=pos_col, sticky="w")
+            pos_col += 1
+
+        tk.Label(common_frame, text="Şeffaflık (%):").grid(row=1, column=0, sticky="w", pady=5)
+        self.opacity_scale = tk.Scale(common_frame, from_=0, to=100, orient="horizontal", length=300)
+        self.opacity_scale.set(70)
+        self.opacity_scale.grid(row=1, column=1, columnspan=len(positions), sticky="ew")
+
+        # --- Kontrol Butonları ---
+        button_frame = tk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+        tk.Button(button_frame, text="Uygula", command=self.apply, bg="#4CAF50", fg="white").pack(side="right", padx=5)
+        tk.Button(button_frame, text="İptal", command=self.top.destroy).pack(side="right")
+        
+        self.toggle_options()
+
+    def toggle_options(self):
+        if self.watermark_type.get() == "text":
+            self.logo_frame.pack_forget()
+            self.text_frame.pack(fill="x", pady=5)
+        else:
+            self.text_frame.pack_forget()
+            self.logo_frame.pack(fill="x", pady=5)
+            
+    def choose_color(self):
+        color_code = colorchooser.askcolor(title="Metin Rengi Seçin")
+        if color_code and color_code[0]:
+            self.text_color = tuple(int(c) for c in color_code[0])
+
+    def browse_logo(self):
+        path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")])
+        if path:
+            self.logo_path_var.set(path)
+
+    def apply(self):
+        base_image = self.base_image_pil.copy()
+        
+        watermark_obj = None
+        ww, wh = 0, 0 # Filigranın genişlik ve yüksekliği
+
+        # Adım 1: Filigran nesnesini ve boyutlarını hazırla
+        if self.watermark_type.get() == "logo":
+            logo_path = self.logo_path_var.get()
+            if not logo_path:
+                messagebox.showerror("Hata", "Lütfen bir logo dosyası seçin.", parent=self.top)
+                return
+            try:
+                logo = Image.open(logo_path).convert("RGBA")
+            except Exception as e:
+                messagebox.showerror("Hata", f"Logo açılamadı: {e}", parent=self.top)
+                return
+
+            # Boyutlandırma
+            size_percent = self.logo_size_scale.get()
+            target_width = int(base_image.width * (size_percent / 100))
+            ratio = target_width / logo.width
+            target_height = int(logo.height * ratio)
+            logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            
+            # Şeffaflık
+            logo_data = logo.getdata()
+            new_data = []
+            opacity_percent = self.opacity_scale.get() / 100
+            for item in logo_data:
+                new_alpha = int(item[3] * opacity_percent)
+                new_data.append((item[0], item[1], item[2], new_alpha))
+            logo.putdata(new_data)
+            
+            watermark_obj = logo
+            ww, wh = watermark_obj.size
+
+        else: # Metin filigranı
+            text = self.text_entry.get()
+            if not text:
+                messagebox.showerror("Hata", "Lütfen filigran metnini girin.", parent=self.top)
+                return
+            try:
+                font_size = int(self.font_size_entry.get())
+            except ValueError:
+                messagebox.showerror("Hata", "Yazı boyutu geçerli bir sayı olmalı.", parent=self.top)
+                return
+            
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except IOError:
+                font = ImageFont.load_default()
+
+            # Metnin boyutlarını hesapla
+            draw = ImageDraw.Draw(base_image) # Boyut hesaplamak için geçici çizim nesnesi
+            _, _, ww, wh = draw.textbbox((0, 0), text, font=font)
+
+            # Metin bilgilerini bir demet içinde sakla
+            opacity = int(255 * (self.opacity_scale.get() / 100))
+            final_text_color = self.text_color + (opacity,)
+            watermark_obj = (text, font, final_text_color)
+        
+        if watermark_obj is None: return
+
+        # Adım 2: Ortak Konumlandırma Mantığı
+        margin = 10
+        pos_choice = self.position_var.get()
+        
+        if pos_choice == "top_left":
+            position = (margin, margin)
+        elif pos_choice == "top_right":
+            position = (base_image.width - ww - margin, margin)
+        elif pos_choice == "bottom_left":
+            position = (margin, base_image.height - wh - margin)
+        elif pos_choice == "center":
+            position = ((base_image.width - ww) // 2, (base_image.height - wh) // 2)
+        else: # bottom_right (varsayılan)
+            position = (base_image.width - ww - margin, base_image.height - wh - margin)
+
+        # Adım 3: Hesaplanan konuma göre filigranı uygula
+        final_image_pil = None
+        if self.watermark_type.get() == "logo":
+            base_image.paste(watermark_obj, position, mask=watermark_obj)
+            final_image_pil = base_image
+        else: # Metin
+            text, font, color = watermark_obj
+            # Metni çizmek için yeni, şeffaf bir katman oluştur
+            txt_layer = Image.new("RGBA", base_image.size, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(txt_layer)
+            # Metni DOĞRU konuma çiz
+            draw.text(position, text, font=font, fill=color)
+            # Ana resim ile metin katmanını birleştir
+            final_image_pil = Image.alpha_composite(base_image, txt_layer)
+
+        # Sonucu OpenCV'nin anlayacağı BGR formatına geri çevir
+        final_image_pil = final_image_pil.convert("RGB") # JPG uyumluluğu için
+        self.result_image = cv2.cvtColor(np.array(final_image_pil), cv2.COLOR_RGB2BGR)
+        
+        self.top.destroy()
 
 
 # ==============================================================================
@@ -329,6 +523,10 @@ class ImageToolApp:
         selection_frame.pack(side="left", padx=5, pady=5)
         tk.Radiobutton(selection_frame, text="Kare", variable=self.selection_type, value="rectangle").pack(side="left")
         tk.Radiobutton(selection_frame, text="Yuvarlak", variable=self.selection_type, value="oval").pack(side="left")
+        
+        # DEĞİŞİKLİK: Filigran butonu eklendi.
+        self.btn_watermark = tk.Button(btn_frame, text="Filigran Ekle...", command=self.show_watermark_dialog, state="disabled")
+        self.btn_watermark.pack(side="left", padx=10)
 
         right_btn_frame = tk.Frame(btn_frame)
         right_btn_frame.pack(side="right", padx=10)
@@ -387,6 +585,8 @@ class ImageToolApp:
             self.add_to_history(self.cv_image.copy())
             self.update_display_image()
             self.btn_save.config(state="normal")
+            # DEĞİŞİKLİK: Filigran butonu aktif hale getirildi
+            self.btn_watermark.config(state="normal")
             self.btn_undo.config(state="disabled")
         except Exception as e:
             messagebox.showerror("Hata", f"Resim açılırken hata oluştu: {str(e)}")
@@ -500,6 +700,22 @@ class ImageToolApp:
     def show_save_options(self):
         if self.cv_image is not None:
             SaveOptionsDialog(self.root, self.cv_image)
+
+    # YENİ EKLENEN FONKSİYON
+    def show_watermark_dialog(self):
+        if self.cv_image is None:
+            return
+        
+        dialog = WatermarkDialog(self.root, self.cv_image)
+        # Bu satır, diyalog penceresi kapanana kadar ana uygulamanın beklemesini sağlar.
+        self.root.wait_window(dialog.top) 
+        
+        # Diyalog kapandıktan sonra, bir sonuç üretip üretmediğini kontrol et
+        if dialog.result_image is not None:
+            self.cv_image = dialog.result_image
+            self.add_to_history(self.cv_image.copy())
+            self.update_display_image()
+            messagebox.showinfo("Başarılı", "Filigran başarıyla uygulandı.")
 
 # ==============================================================================
 # BÖLÜM 3: UYGULAMAYI BAŞLATMA
