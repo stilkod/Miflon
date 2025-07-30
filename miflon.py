@@ -265,8 +265,14 @@ class SaveOptionsDialog:
                 cv2.imwrite(filepath, final_image, [cv2.IMWRITE_JPEG_QUALITY, self.quality_scale.get()])
             else:
                 cv2.imwrite(filepath, final_image)
-            messagebox.showinfo("Başarılı", f"Fotoğraf başarıyla kaydedildi:\n{filepath}", parent=self.top)
+            
+            # #!#!# DÜZELTME BURADA YAPILDI #!#!#
+            # Dosya yolunu, kullanıcıya göstermeden önce işletim sistemine uygun standart hale getiriyoruz.
+            gosterilecek_yol = os.path.normpath(filepath)
+            
+            messagebox.showinfo("Başarılı", f"Fotoğraf başarıyla kaydedildi:\n{gosterilecek_yol}", parent=self.top)
             self.top.destroy()
+            
         except Exception as e:
             messagebox.showerror("Kaydetme Hatası", f"Bir hata oluştu: {e}", parent=self.top)
 
