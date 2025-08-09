@@ -73,6 +73,27 @@ def parse_dnd_paths(data: str):
     exts = (".jpg", ".jpeg", ".png", ".bmp")
     return [p for p in paths if os.path.splitext(p)[1].lower() in exts]
 
+# -------------------------------------------------------------
+# Pencereyi ortala
+# -------------------------------------------------------------
+def center_window(parent, win):
+    # Diyalog yerleşimi hesaplanabilsin diye ölçüleri güncelle
+    win.update_idletasks()
+    parent.update_idletasks()
+
+    p_x = parent.winfo_rootx()
+    p_y = parent.winfo_rooty()
+    p_w = parent.winfo_width()
+    p_h = parent.winfo_height()
+
+    w = win.winfo_width()
+    h = win.winfo_height()
+
+    x = p_x + max(0, (p_w - w) // 2)
+    y = p_y + max(0, (p_h - h) // 2)
+
+    win.geometry(f"+{x}+{y}")
+
 # ==============================================================================
 # KIRPMA DİYALOĞU (Uygula → Görseli günceller)
 # ==============================================================================
@@ -271,6 +292,7 @@ class WatermarkSettingsDialog:
         bf.pack(fill="x", pady=(8,0))
         tk.Button(bf, text="Kaydet", bg="#4CAF50", fg="white", command=self.save).pack(side="right", padx=5)
         tk.Button(bf, text="İptal", command=self.top.destroy).pack(side="right")
+        center_window(parent, self.top)
 
     def choose_color(self):
         c = colorchooser.askcolor(title="Metin Rengi Seçin")
@@ -377,6 +399,7 @@ class SaveDialog:
         self.index_var.trace_add("write", lambda *a: self.update_preview())
         self.format_var.trace_add("write", lambda *a: self.update_preview())
         self.out_folder.trace_add("write", lambda *a: self.update_preview())
+        center_window(parent, self.top)
 
     def toggle_quality(self):
         if self.format_var.get().upper() == "JPG":
@@ -387,7 +410,7 @@ class SaveDialog:
             self.qscale.configure(state="disabled")
 
     def choose_folder(self):
-        d = filedialog.askdirectory(initialdir=self.out_folder.get() or str(Path.home()))
+        d = filedialog.askdirectory(parent=self.top,initialdir=self.out_folder.get() or str(Path.home()))
         if d:
             self.out_folder.set(d)
 
@@ -510,7 +533,7 @@ class ImageToolApp:
 
         self.btn_open = tk.Button(step, text="1) Fotoğraf Aç", command=self.open_images)
         self.btn_open.pack(side="left", padx=8)
-
+  
         # Efekt/Seçim (2. adım)
         fx_cfg = _read_config().get("app", {})
         self.effect_type = tk.StringVar(value=fx_cfg.get("effect_type", "blur"))
@@ -589,7 +612,7 @@ class ImageToolApp:
 
     # ----- Batch/Fotoğraf yükleme -----
     def open_images(self):
-        files = filedialog.askopenfilenames(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
+        files = filedialog.askopenfilenames(parent=self.root,title="Fotoğraf Aç",filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
         if not files:
             return
         self.batch_files = list(files)
