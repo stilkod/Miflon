@@ -1,11 +1,20 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, colorchooser
+from tkinter import filedialog, messagebox, colorchooser, ttk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import cv2
 import numpy as np
 import os
 import json
+import re
 from pathlib import Path
+from datetime import datetime
+
+# Opsiyonel: Drag&Drop
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    DND_AVAILABLE = True
+except Exception:
+    DND_AVAILABLE = False
 
 # -------------------------------------------------------------
 # Yapılandırma (JSON) yardımcıları
@@ -51,6 +60,18 @@ def parse_ratio(value: str):
     except Exception:
         return None
 
+# -------------------------------------------------------------
+# Drag&Drop dosya listesi ayrıştırma
+# -------------------------------------------------------------
+def parse_dnd_paths(data: str):
+    # event.data örnekleri:
+    # - Windows: "{C:\path with spaces\file 1.jpg} {C:\other\file2.png}"
+    # - *nix: "/home/user/file1.jpg /home/user/file2.png"
+    tokens = re.findall(r'\{([^}]*)\}|([^\s]+)', data)
+    paths = [t[0] or t[1] for t in tokens]
+    # yalnızca resim dosyalarını filtrele
+    exts = (".jpg", ".jpeg", ".png", ".bmp")
+    return [p for p in paths if os.path.splitext(p)[1].lower() in exts]
 
 # ==============================================================================
 # KIRPMA DİYALOĞU (Uygula → Görseli günceller)
@@ -189,11 +210,9 @@ class CropDialog:
             crop_y = max(0, min(crop_y, H - new_h))
             final = final[crop_y:crop_y+new_h, crop_x:crop_x+new_w]
 
-        # Kırpma tercihini kaydet
         _write_config({"crop": {"ratio": self.crop_var.get()}})
         self.result_image = final
         self.top.destroy()
-
 
 # ==============================================================================
 # FİLİGRAN/LOGO AYARLARI DİYALOĞU (Ayarları JSON'a yazar)
@@ -210,7 +229,7 @@ class WatermarkSettingsDialog:
         self.enable_text = tk.BooleanVar(value=wm.get("enable_text", True))
         self.enable_logo = tk.BooleanVar(value=wm.get("enable_logo", True))
         self.text = tk.StringVar(value=wm.get("text", "* KVKK gereği bazı yüzler bulanıklaştırılmıştır."))
-        self.text_size_percent = tk.IntVar(value=int(wm.get("text_size_percent", 2)))
+        self.text_size_percent = tk.IntVar(value=int(wm.get("text_size_percent", 2)))  # %2 varsayılan
         self.opacity = tk.IntVar(value=int(wm.get("opacity", 40)))
         color = wm.get("color", [255, 255, 255])
         self.text_color = (int(color[0]), int(color[1]), int(color[2]))
@@ -221,7 +240,7 @@ class WatermarkSettingsDialog:
         main.pack(expand=True, fill="both")
 
         # Metin
-        tf = tk.LabelFrame(main, text="Metin", padx=8, pady=8)
+        tf = tk.LabelFrame(main, text="Metin (sağ alt)", padx=8, pady=8)
         tf.pack(fill="x", pady=(0,8))
         tk.Checkbutton(tf, text="Metin ekle", variable=self.enable_text).grid(row=0, column=0, sticky="w", pady=2, columnspan=2)
         tk.Label(tf, text="İçerik:").grid(row=1, column=0, sticky="w")
@@ -232,7 +251,7 @@ class WatermarkSettingsDialog:
         tk.Button(tf, text="Renk Seç", command=self.choose_color).grid(row=3, column=1, sticky="w", padx=(6,0))
 
         # Logo
-        lf = tk.LabelFrame(main, text="Logo", padx=8, pady=8)
+        lf = tk.LabelFrame(main, text="Logo (merkez)", padx=8, pady=8)
         lf.pack(fill="x", pady=(0,8))
         tk.Checkbutton(lf, text="Logo ekle", variable=self.enable_logo).grid(row=0, column=0, sticky="w", pady=2, columnspan=3)
         tk.Label(lf, text="Dosya:").grid(row=1, column=0, sticky="w")
@@ -262,8 +281,7 @@ class WatermarkSettingsDialog:
         p = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")])
         if p:
             self.logo_path.set(p)
-            # Logo yolu anında kalıcı olsun (istenen davranış)
-            _write_config({"watermark": {"logo_path": p}})
+            _write_config({"watermark": {"logo_path": p}})  # hemen kaydet
 
     def save(self):
         patch = {
@@ -276,15 +294,180 @@ class WatermarkSettingsDialog:
                 "opacity": int(self.opacity.get()),
                 "logo_path": self.logo_path.get(),
                 "logo_size_percent": int(self.logo_size_percent.get()),
-                # pozisyon sabit: metin sağ alt, logo merkez (istenen davranış)
             }
         }
         _write_config(patch)
         self.top.destroy()
 
+# ==============================================================================
+# KAYDET DİYALOĞU (şablon + klasör + format + kalite + önizleme)
+# ==============================================================================
+class SaveDialog:
+    DEFAULT_TEMPLATES = [
+        "{name}_miflon",
+        "{name}_{date}",
+        "{name}_{index:03d}",
+        "{name}_{date}_{index:03d}",
+        "{name}_{w}x{h}",
+        "{name}_wm_{index:02d}",
+    ]
+
+    def __init__(self, parent, cv_image, original_path, batch_pos=None, batch_total=None):
+        self.top = tk.Toplevel(parent)
+        self.top.title("Kaydet")
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        self.cv_image = cv_image
+        self.original_path = original_path
+        self.h, self.w = self.cv_image.shape[:2]
+
+        cfg = _read_config().get("save", {})
+        self.out_folder = tk.StringVar(value=cfg.get("folder", os.path.dirname(original_path) if original_path else str(Path.home())))
+        self.format_var = tk.StringVar(value=cfg.get("format", "JPG"))
+        self.jpg_quality = tk.IntVar(value=int(cfg.get("jpg_quality", 95)))
+        self.template_var = tk.StringVar(value=cfg.get("template", "{name}_{index:03d}"))
+        self.index_var = tk.IntVar(value=int(cfg.get("index", 1)))
+
+        main = tk.Frame(self.top, padx=12, pady=12)
+        main.pack(expand=True, fill="both")
+
+        # Üst: klasör + format + kalite
+        f1 = tk.Frame(main)
+        f1.pack(fill="x", pady=(0,8))
+        tk.Label(f1, text="Kayıt Klasörü:").grid(row=0, column=0, sticky="w")
+        tk.Entry(f1, textvariable=self.out_folder, width=40).grid(row=0, column=1, sticky="ew", padx=(6,6))
+        tk.Button(f1, text="Seç...", command=self.choose_folder).grid(row=0, column=2)
+        f1.grid_columnconfigure(1, weight=1)
+
+        f2 = tk.Frame(main)
+        f2.pack(fill="x", pady=(0,8))
+        tk.Label(f2, text="Format:").pack(side="left")
+        ttk.Combobox(f2, textvariable=self.format_var, values=["JPG", "PNG", "BMP"], width=6, state="readonly").pack(side="left", padx=(6,12))
+        self.qlab = tk.Label(f2, text="JPG Kalitesi:")
+        self.qlab.pack(side="left")
+        self.qscale = tk.Scale(f2, from_=50, to=100, orient="horizontal", variable=self.jpg_quality, length=200)
+        self.qscale.pack(side="left", padx=(6,0))
+        self.format_var.trace_add("write", lambda *a: self.toggle_quality())
+
+        # Şablon
+        f3 = tk.LabelFrame(main, text="İsim Şablonu", padx=8, pady=8)
+        f3.pack(fill="x", pady=(0,8))
+        ttk.Combobox(f3, values=self.DEFAULT_TEMPLATES, textvariable=self.template_var, width=40).grid(row=0, column=0, sticky="ew", columnspan=2)
+        tk.Label(f3, text="Index başlangıcı:").grid(row=1, column=0, sticky="w", pady=(6,0))
+        tk.Spinbox(f3, from_=1, to=999999, textvariable=self.index_var, width=8).grid(row=1, column=1, sticky="w", pady=(6,0))
+        tk.Label(f3, text="Değişkenler: {name}, {index[:0Nd]}, {date}, {time}, {w}, {h}").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6,0))
+
+        # Önizleme
+        self.preview_lbl = tk.Label(main, text="", fg="#00AA55")
+        self.preview_lbl.pack(fill="x", pady=(4,8))
+
+        # Butonlar
+        bf = tk.Frame(main)
+        bf.pack(fill="x")
+        if batch_pos and batch_total:
+            tk.Label(bf, text=f"Fotoğraf: {batch_pos}/{batch_total}").pack(side="left", padx=(0,8))
+        tk.Button(bf, text="Kaydet", bg="#4CAF50", fg="white", command=self.save).pack(side="right", padx=5)
+        tk.Button(bf, text="İptal", command=self.top.destroy).pack(side="right")
+
+        self.saved = False
+        self.toggle_quality()
+        self.update_preview()
+        self.template_var.trace_add("write", lambda *a: self.update_preview())
+        self.index_var.trace_add("write", lambda *a: self.update_preview())
+        self.format_var.trace_add("write", lambda *a: self.update_preview())
+        self.out_folder.trace_add("write", lambda *a: self.update_preview())
+
+    def toggle_quality(self):
+        if self.format_var.get().upper() == "JPG":
+            self.qlab.configure(state="normal")
+            self.qscale.configure(state="normal")
+        else:
+            self.qlab.configure(state="disabled")
+            self.qscale.configure(state="disabled")
+
+    def choose_folder(self):
+        d = filedialog.askdirectory(initialdir=self.out_folder.get() or str(Path.home()))
+        if d:
+            self.out_folder.set(d)
+
+    def _sanitize(self, name: str):
+        # Windows yasak karakterleri temizle
+        return re.sub(r'[\\/:*?"<>|]', '_', name)
+
+    def _render_template(self, tpl, name, index, w, h, ext):
+        # {index} veya {index:03d} gibi
+        def repl(match):
+            token = match.group(1)
+            fmt = match.group(2)
+            if token == "name":
+                return name
+            elif token == "date":
+                return datetime.now().strftime("%Y%m%d")
+            elif token == "time":
+                return datetime.now().strftime("%H%M%S")
+            elif token == "w":
+                return str(w)
+            elif token == "h":
+                return str(h)
+            elif token == "ext":
+                return ext
+            elif token == "index":
+                pad = 0
+                if fmt:
+                    m = re.match(r":0(\d+)d", fmt)
+                    if m:
+                        pad = int(m.group(1))
+                return str(index).zfill(pad) if pad > 0 else str(index)
+            return ""
+        return re.sub(r"\{(name|date|time|w|h|ext|index)(:[^}]*)?\}", repl, tpl)
+
+    def update_preview(self):
+        folder = self.out_folder.get().strip() or str(Path.home())
+        ext = self.format_var.get().lower()
+        name = "image"
+        if self.original_path:
+            name = os.path.splitext(os.path.basename(self.original_path))[0]
+        try:
+            idx = int(self.index_var.get())
+        except Exception:
+            idx = 1
+        filename = self._render_template(self.template_var.get(), name, idx, self.w, self.h, ext)
+        filename = self._sanitize(filename) + f".{ext}"
+        self.preview_path = os.path.join(folder, filename)
+        self.preview_lbl.config(text=f"Örnek: {self.preview_path}")
+
+    def save(self):
+        # Ayarları kalıcı yap
+        _write_config({
+            "save": {
+                "folder": self.out_folder.get().strip(),
+                "format": self.format_var.get(),
+                "jpg_quality": int(self.jpg_quality.get()),
+                "template": self.template_var.get(),
+                "index": int(self.index_var.get())
+            }
+        })
+        # Kaydet
+        out_path = self.preview_path
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        try:
+            ext = os.path.splitext(out_path)[1].lower()
+            if ext in (".jpg", ".jpeg"):
+                cv2.imwrite(out_path, self.cv_image, [cv2.IMWRITE_JPEG_QUALITY, int(self.jpg_quality.get())])
+            else:
+                cv2.imwrite(out_path, self.cv_image)
+            # index +1 ve kalıcı
+            new_idx = int(self.index_var.get()) + 1
+            _write_config({"save": {"index": new_idx}})
+            self.saved = True
+            messagebox.showinfo("Kaydedildi", f"Fotoğraf kaydedildi:\n{os.path.normpath(out_path)}", parent=self.top)
+            self.top.destroy()
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kaydetme hatası: {e}", parent=self.top)
 
 # ==============================================================================
-# ANA UYGULAMA (ID Photos Pro benzeri adım mantığı)
+# ANA UYGULAMA (ID Photos Pro benzeri adım mantığı + DnD + şablonlu kaydet)
 # ==============================================================================
 class ImageToolApp:
     def __init__(self, root):
@@ -303,6 +486,7 @@ class ImageToolApp:
         self.start_x, self.start_y = 0, 0
         self.image_offset_x, self.image_offset_y = 0, 0
         self.display_image_w, self.display_image_h = 1, 1
+        self.current_path = None
 
         # Batch (çoklu dosya)
         self.batch_files = []
@@ -312,7 +496,15 @@ class ImageToolApp:
         self.canvas = tk.Canvas(root, cursor="cross", bg='gray20')
         self.canvas.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Step bar (ID Photos Pro benzeri: soldan sağa adımlar)
+        # DnD
+        if DND_AVAILABLE:
+            try:
+                self.canvas.drop_target_register(DND_FILES)
+                self.canvas.dnd_bind('<<Drop>>', self.on_drop_files)
+            except Exception:
+                pass
+
+        # Step bar
         step = tk.Frame(root)
         step.pack(fill="x", side="bottom", pady=6)
 
@@ -320,14 +512,15 @@ class ImageToolApp:
         self.btn_open.pack(side="left", padx=8)
 
         # Efekt/Seçim (2. adım)
+        fx_cfg = _read_config().get("app", {})
+        self.effect_type = tk.StringVar(value=fx_cfg.get("effect_type", "blur"))
+        self.selection_type = tk.StringVar(value=fx_cfg.get("selection_type", "oval"))
+        self.blur_value = tk.IntVar(value=int(fx_cfg.get("blur_value", 19)))
+        self.pixel_value = tk.IntVar(value=int(fx_cfg.get("pixel_value", 7)))
+        self.feather_value = tk.IntVar(value=int(fx_cfg.get("feather_value", 8)))
+
         fx = tk.LabelFrame(step, text="2) Bulanıklaştırma/Piksel", padx=6, pady=4)
         fx.pack(side="left", padx=6)
-        self.effect_type = tk.StringVar(value=_read_config().get("app", {}).get("effect_type", "blur"))
-        self.selection_type = tk.StringVar(value=_read_config().get("app", {}).get("selection_type", "oval"))
-        self.blur_value = tk.IntVar(value=int(_read_config().get("app", {}).get("blur_value", 19)))
-        self.pixel_value = tk.IntVar(value=int(_read_config().get("app", {}).get("pixel_value", 7)))
-        self.feather_value = tk.IntVar(value=int(_read_config().get("app", {}).get("feather_value", 8)))
-
         tk.Radiobutton(fx, text="Blur", variable=self.effect_type, value="blur").pack(side="left")
         tk.Radiobutton(fx, text="Pixel", variable=self.effect_type, value="pixel").pack(side="left")
         tk.Scale(fx, from_=3, to=99, orient="horizontal", label="Blur", resolution=2, length=120, variable=self.blur_value).pack(side="left", padx=4)
@@ -351,7 +544,7 @@ class ImageToolApp:
         self.btn_save = tk.Button(step, text="5) Kaydet...", command=self.save_current, state="disabled")
         self.btn_save.pack(side="left", padx=8)
 
-        # Sağ tarafta geri al
+        # Sağ: geri al
         right = tk.Frame(step)
         right.pack(side="right", padx=8)
         self.btn_undo = tk.Button(right, text="Geri Al (Ctrl+Z)", command=self.undo, state="disabled")
@@ -367,8 +560,6 @@ class ImageToolApp:
         self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
         self.root.bind('<Configure>', self.on_window_resize)
         self.root.bind('<Control-z>', self.undo)
-
-        # Pencere kapanışı
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     # ----- Genel ayarlar kaydet -----
@@ -387,6 +578,15 @@ class ImageToolApp:
         self.save_app_settings()
         self.root.destroy()
 
+    # ----- Drag & Drop -----
+    def on_drop_files(self, event):
+        paths = parse_dnd_paths(event.data)
+        if not paths:
+            return
+        self.batch_files = paths
+        self.batch_index = 0
+        self.load_image_from_path(self.batch_files[self.batch_index])
+
     # ----- Batch/Fotoğraf yükleme -----
     def open_images(self):
         files = filedialog.askopenfilenames(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
@@ -403,6 +603,7 @@ class ImageToolApp:
                 self.cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGBA2BGR)
             else:
                 self.cv_image = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
+            self.current_path = filepath
 
             self.update_window_title(filepath)
             self.history = []
@@ -430,6 +631,7 @@ class ImageToolApp:
 
     def reset_to_initial_state(self):
         self.cv_image = None
+        self.current_path = None
         self.history, self.current_step = [], -1
         self.canvas.delete("all")
         self.update_window_title(None)
@@ -633,7 +835,7 @@ class ImageToolApp:
         w, h = base.size
         layer = Image.new("RGBA", (w, h), (0,0,0,0))
 
-        # Logo ortada
+        # Logo merkez
         if enable_logo and logo_path and os.path.isfile(logo_path):
             try:
                 logo = Image.open(logo_path).convert("RGBA")
@@ -646,7 +848,7 @@ class ImageToolApp:
                     data[..., 3] = (data[..., 3].astype(np.float32) * (opacity/100.0)).astype(np.uint8)
                     logo = Image.fromarray(data, mode="RGBA")
                 lw, lh = logo.size
-                pos = ((w - lw)//2, (h - lh)//2)  # merkez
+                pos = ((w - lw)//2, (h - lh)//2)
                 layer.paste(logo, pos, mask=logo)
             except Exception as e:
                 messagebox.showwarning("Logo", f"Logo uygulanamadı: {e}")
@@ -658,7 +860,6 @@ class ImageToolApp:
             font_size = max(8, desired_h)
             font = self._load_font(font_size)
             tw, th = self._measure_text(draw, text, font)
-            # genişliğe sığdır
             max_w = int(w * 0.94)
             if tw > max_w and tw > 0:
                 scale = max_w / tw
@@ -667,7 +868,7 @@ class ImageToolApp:
                 tw, th = self._measure_text(draw, text, font)
             col = (text_color[0], text_color[1], text_color[2], int(255 * (opacity/100.0)))
             margin = 12
-            pos = (w - tw - margin, h - th - margin)  # sağ alt
+            pos = (w - tw - margin, h - th - margin)
             draw.text(pos, text, font=font, fill=col)
 
         final_pil = Image.alpha_composite(base, layer).convert("RGB")
@@ -680,50 +881,20 @@ class ImageToolApp:
     def save_current(self):
         if self.cv_image is None:
             return
-        cfg = _read_config()
-        jpg_q = int(cfg.get("save", {}).get("jpg_quality", 95))
-
-        # Basit bir kalite seçici
-        qtop = tk.Toplevel(self.root)
-        qtop.title("Kaydet")
-        qtop.transient(self.root)
-        qtop.grab_set()
-        tk.Label(qtop, text="JPG Kalitesi:").pack(padx=12, pady=(12, 2))
-        qvar = tk.IntVar(value=jpg_q)
-        tk.Scale(qtop, from_=50, to=100, orient="horizontal", variable=qvar, length=260).pack(padx=12, pady=(0,12))
-        btnf = tk.Frame(qtop)
-        btnf.pack(fill="x", padx=12, pady=(0,12))
-        def do_save():
-            _write_config({"save": {"jpg_quality": int(qvar.get())}})
-            qtop.destroy()
-            self._save_dialog_and_next(int(qvar.get()))
-        tk.Button(btnf, text="Kaydet...", bg="#4CAF50", fg="white", command=do_save).pack(side="right", padx=5)
-        tk.Button(btnf, text="İptal", command=qtop.destroy).pack(side="right")
-
-    def _save_dialog_and_next(self, jpg_quality):
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".jpg",
-            filetypes=[("JPG file", "*.jpg;*.jpeg"), ("PNG file", "*.png"), ("BMP file", "*.bmp")]
-        )
-        if not filepath:
-            return
-        ext = os.path.splitext(filepath)[1].lower()
-        try:
-            if ext in (".jpg", ".jpeg"):
-                cv2.imwrite(filepath, self.cv_image, [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)])
-            else:
-                cv2.imwrite(filepath, self.cv_image)
-            messagebox.showinfo("Kaydedildi", f"Fotoğraf kaydedildi:\n{os.path.normpath(filepath)}")
+        dlg = SaveDialog(self.root, self.cv_image, self.current_path,
+                         batch_pos=(self.batch_index + 1) if self.batch_index >= 0 else None,
+                         batch_total=len(self.batch_files) if self.batch_files else None)
+        self.root.wait_window(dlg.top)
+        if dlg.saved:
             self.after_save_flow()
-        except Exception as e:
-            messagebox.showerror("Hata", f"Kaydetme hatası: {e}")
-            return
-
 
 # ==============================================================================
 # Uygulamayı başlat
 # ==============================================================================
 if __name__ == "__main__":
-    root = tk.Tk()
+    if DND_AVAILABLE:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
     app = ImageToolApp(root)
     root.mainloop()
