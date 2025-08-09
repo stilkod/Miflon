@@ -4,522 +4,453 @@ from PIL import Image, ImageTk, ImageDraw, ImageFont
 import cv2
 import numpy as np
 import os
-import json # YENİ: Ayarları kaydetmek/yüklemek için eklendi
+import json
+from pathlib import Path
 
-# YENİ: Yapılandırma dosyasının adı
-CONFIG_FILE = "miflon_config.json"
+# -------------------------------------------------------------
+# Yapılandırma (JSON) yardımcıları
+# -------------------------------------------------------------
+CONFIG_FILE = str(Path.home() / ".miflon_config.json")
+
+def _read_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _deep_update(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_update(dst[k], v)
+        else:
+            dst[k] = v
+
+def _write_config(patch):
+    data = _read_config()
+    _deep_update(data, patch)
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+
+# -------------------------------------------------------------
+# Güvenli kırpma oranı parse (eval yerine)
+# -------------------------------------------------------------
+def parse_ratio(value: str):
+    if value == "original":
+        return None
+    try:
+        a, b = value.split(":")
+        a = float(a.strip())
+        b = float(b.strip())
+        if b == 0:
+            return None
+        return a / b
+    except Exception:
+        return None
 
 
 # ==============================================================================
-# BÖLÜM 1: KAYDETME, KIRPMA VE YENİDEN BOYUTLANDIRMA DİYALOG PENCERESİ
+# KIRPMA DİYALOĞU (Uygula → Görseli günceller)
 # ==============================================================================
-class SaveOptionsDialog:
-    def __init__(self, parent, image_to_save):
+class CropDialog:
+    def __init__(self, parent, cv_image):
         self.top = tk.Toplevel(parent)
-        self.top.title("Kaydet, Kırp ve Yeniden Boyutlandır")
+        self.top.title("Kırp")
         self.top.transient(parent)
         self.top.grab_set()
 
-        self.image_to_save = image_to_save
-        self.original_h, self.original_w = self.image_to_save.shape[:2]
+        self.cv_image = cv_image
+        self.h, self.w = self.cv_image.shape[:2]
 
-        # --- Değişkenler ---
+        cfg = _read_config().get("crop", {})
+        self.crop_var = tk.StringVar(value=cfg.get("ratio", "16:9"))
+
         self.crop_x_offset_preview = 0
         self.crop_y_offset_preview = 0
         self.dragging = False
         self.last_drag_x = 0
         self.last_drag_y = 0
 
-        # --- Arayüz Elemanları ---
-        main_frame = tk.Frame(self.top, padx=15, pady=15)
-        main_frame.pack(expand=True, fill="both")
+        main = tk.Frame(self.top, padx=12, pady=12)
+        main.pack(expand=True, fill="both")
 
-        left_panel = tk.Frame(main_frame)
-        left_panel.pack(side="left", fill="y", padx=(0, 15))
-        right_panel = tk.Frame(main_frame)
-        right_panel.pack(side="left", fill="both", expand=True)
+        left = tk.Frame(main)
+        left.pack(side="left", fill="y", padx=(0, 12))
+        right = tk.Frame(main)
+        right.pack(side="left", expand=True, fill="both")
 
-        # --- Sol Panel (Ayarlar) ---
-        self.crop_frame = tk.LabelFrame(left_panel, text="1. Kırpma Oranı Seç", padx=10, pady=10)
-        self.crop_frame.pack(fill="x", pady=(0, 10))
-        self.crop_var = tk.StringVar(value="16:9")
+        lf = tk.LabelFrame(left, text="Kırpma Oranı", padx=8, pady=8)
+        lf.pack(fill="x", pady=(0,8))
         crop_ratios = {
             "Kırpma Yok (Orjinal)": "original", "Manşet (21:9)": "21:9",
             "Galeri (16:9)": "16:9", "Klasik (4:3)": "4:3", "Kare (1:1)": "1:1"
         }
-        for text, value in crop_ratios.items():
-            tk.Radiobutton(self.crop_frame, text=text, variable=self.crop_var,
-                          value=value, command=self.on_crop_change).pack(anchor="w")
+        for text, val in crop_ratios.items():
+            tk.Radiobutton(lf, text=text, variable=self.crop_var, value=val,
+                           command=self.update_preview).pack(anchor="w")
 
-        self.size_frame = tk.LabelFrame(left_panel, text="2. Yeniden Boyutlandır", padx=10, pady=10)
-        self.size_frame.pack(fill="x", pady=10)
-        self.size_var = tk.StringVar(value="original")
-        self.size_buttons_frame = tk.Frame(self.size_frame)
-        self.size_buttons_frame.pack(fill="x")
+        btns = tk.Frame(left)
+        btns.pack(fill="x", pady=(8,0))
+        tk.Button(btns, text="Uygula", bg="#4CAF50", fg="white",
+                  command=self.apply).pack(fill="x", pady=(0,6))
+        tk.Button(btns, text="İptal", command=self.top.destroy).pack(fill="x")
 
-        tk.Radiobutton(self.size_buttons_frame, text="Özel Boyut:", variable=self.size_var,
-                      value="custom", command=self.toggle_custom_size_entries).pack(anchor="w")
-        self.custom_frame = tk.Frame(self.size_frame)
-        self.custom_frame.pack(fill="x", padx=20)
-        tk.Label(self.custom_frame, text="Genişlik:").grid(row=0, column=0)
-        self.width_entry = tk.Entry(self.custom_frame, width=7)
-        self.width_entry.grid(row=0, column=1, padx=2)
-        tk.Label(self.custom_frame, text="Yükseklik:").grid(row=0, column=2, padx=(5,0))
-        self.height_entry = tk.Entry(self.custom_frame, width=7)
-        self.height_entry.grid(row=0, column=3, padx=2)
+        self.canvas = tk.Canvas(right, bg="gray20", cursor="fleur")
+        self.canvas.pack(expand=True, fill="both")
+        self.canvas.bind("<ButtonPress-1>", self.start_drag)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.stop_drag)
 
-        self.quality_frame = tk.LabelFrame(left_panel, text="3. JPG Kalitesi", padx=10, pady=10)
-        self.quality_frame.pack(fill="x", pady=10)
-        self.quality_scale = tk.Scale(self.quality_frame, from_=0, to=100, orient="horizontal", label="Kalite", length=200)
-        self.quality_scale.set(95)
-        self.quality_scale.pack(fill="x")
-        
-        tk.Button(left_panel, text="Kaydet", command=self.apply_and_save, bg="#4CAF50", fg="white", height=2).pack(fill="x", side="bottom", pady=5)
-        tk.Button(left_panel, text="İptal", command=self.top.destroy).pack(fill="x", side="bottom")
+        self.result_image = None
 
-        # --- Sağ Panel (Önizleme) ---
-        self.preview_canvas = tk.Canvas(right_panel, bg='gray20', cursor="fleur")
-        self.preview_canvas.pack(fill="both", expand=True)
-        self.preview_canvas.bind("<ButtonPress-1>", self.start_drag)
-        self.preview_canvas.bind("<B1-Motion>", self.on_drag)
-        self.preview_canvas.bind("<ButtonRelease-1>", self.stop_drag)
-
-        self.prepare_preview_image()
-        self.on_crop_change()
-
-    def prepare_preview_image(self):
-        preview = cv2.cvtColor(self.image_to_save, cv2.COLOR_BGR2RGB)
-        preview = Image.fromarray(preview)
-        preview.thumbnail((500, 400))
-        self.original_preview_img = preview
-        self.scale_w = self.original_w / self.original_preview_img.width if self.original_preview_img.width > 0 else 1
-        self.scale_h = self.original_h / self.original_preview_img.height if self.original_preview_img.height > 0 else 1
-
-    def on_crop_change(self):
-        self.crop_x_offset_preview = 0
-        self.crop_y_offset_preview = 0
+        self._prepare_preview_image()
         self.update_preview()
-        self.update_size_options()
-        self.toggle_custom_size_entries()
 
-    def update_preview(self):
-        preview_copy = self.original_preview_img.copy()
-        pw, ph = preview_copy.size
-        
-        overlay = Image.new('RGBA', (pw, ph), (0, 0, 0, 128))
+    def _prepare_preview_image(self):
+        preview = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
+        preview = Image.fromarray(preview)
+        preview.thumbnail((800, 550))
+        self.preview_img = preview
+        self.scale_w = self.w / self.preview_img.width if self.preview_img.width > 0 else 1
+        self.scale_h = self.h / self.preview_img.height if self.preview_img.height > 0 else 1
 
-        if self.crop_var.get() != "original":
-            target_ratio = eval(self.crop_var.get().replace(':', '/'))
-            if pw / ph > target_ratio:
-                crop_h = ph
-                crop_w = int(crop_h * target_ratio)
-                max_offset = pw - crop_w
-                self.crop_x_offset_preview = max(0, min(self.crop_x_offset_preview, max_offset))
-                overlay.paste((0, 0, 0, 0), (int(self.crop_x_offset_preview), 0, int(self.crop_x_offset_preview + crop_w), crop_h))
-            else:
-                crop_w = pw
-                crop_h = int(crop_w / target_ratio)
-                max_offset = ph - crop_h
-                self.crop_y_offset_preview = max(0, min(self.crop_y_offset_preview, max_offset))
-                overlay.paste((0, 0, 0, 0), (0, int(self.crop_y_offset_preview), crop_w, int(self.crop_y_offset_preview + crop_h)))
-        
-        preview_copy.paste(overlay, (0, 0), overlay)
-        
-        self.tk_preview_img = ImageTk.PhotoImage(preview_copy)
-        self.preview_canvas.delete("all")
-        self.preview_canvas.config(width=pw, height=ph)
-        self.preview_canvas.create_image(0, 0, anchor="nw", image=self.tk_preview_img)
-
-    def update_size_options(self):
-        for widget in self.size_buttons_frame.winfo_children():
-            if isinstance(widget, tk.Radiobutton) and widget.cget("value") != "custom":
-                widget.destroy()
-
-        w, h = self.original_w, self.original_h
-        if self.crop_var.get() != "original":
-            target_ratio = eval(self.crop_var.get().replace(':', '/'))
-            if w/h > target_ratio:
-                w = int(h * target_ratio)
-            else:
-                h = int(w / target_ratio)
-        
-        aspect_ratio = w / h if h != 0 else 1.0
-        
-        sizes = {"Orjinal": "original"}
-        if w > 854: sizes[f"Küçük ({854}x{int(854/aspect_ratio)})"] = "small"
-        if w > 1280: sizes[f"Orta ({1280}x{int(1280/aspect_ratio)})"] = "medium"
-        if w > 1920: sizes[f"Büyük ({1920}x{int(1920/aspect_ratio)})"] = "large"
-        
-        for text, value in reversed(list(sizes.items())):
-            rb = tk.Radiobutton(self.size_buttons_frame, text=text, variable=self.size_var,
-                          value=value, command=self.toggle_custom_size_entries)
-            rb.pack(anchor="w")
-        
-        if "medium" in sizes.values():
-            self.size_var.set("medium")
-        else:
-            self.size_var.set("original")
-
-    def toggle_custom_size_entries(self):
-        state = 'normal' if self.size_var.get() == "custom" else 'disabled'
-        self.width_entry.config(state=state)
-        self.height_entry.config(state=state)
-
-    def start_drag(self, event):
+    def start_drag(self, e):
         self.dragging = True
-        self.last_drag_x = event.x
-        self.last_drag_y = event.y
+        self.last_drag_x, self.last_drag_y = e.x, e.y
 
-    # İYİLEŞTİRME: Sürükleme sınırları anlık olarak kontrol ediliyor.
-    def on_drag(self, event):
-        if not self.dragging or self.crop_var.get() == "original": return
-        
-        dx = event.x - self.last_drag_x
-        dy = event.y - self.last_drag_y
-        pw, ph = self.original_preview_img.size
-        target_ratio = eval(self.crop_var.get().replace(':', '/'))
-        
-        if pw / ph > target_ratio:
+    def on_drag(self, e):
+        if not self.dragging:
+            return
+        ratio = parse_ratio(self.crop_var.get())
+        if ratio is None:
+            return
+        dx, dy = e.x - self.last_drag_x, e.y - self.last_drag_y
+        pw, ph = self.preview_img.size
+
+        if pw / ph > ratio:
             crop_h = ph
-            crop_w = int(crop_h * target_ratio)
+            crop_w = int(crop_h * ratio)
             max_offset_x = pw - crop_w
-            new_x = self.crop_x_offset_preview + dx
-            self.crop_x_offset_preview = max(0, min(new_x, max_offset_x))
+            self.crop_x_offset_preview = max(0, min(self.crop_x_offset_preview + dx, max_offset_x))
         else:
             crop_w = pw
-            crop_h = int(crop_w / target_ratio)
+            crop_h = int(crop_w / ratio)
             max_offset_y = ph - crop_h
-            new_y = self.crop_y_offset_preview + dy
-            self.crop_y_offset_preview = max(0, min(new_y, max_offset_y))
+            self.crop_y_offset_preview = max(0, min(self.crop_y_offset_preview + dy, max_offset_y))
 
-        self.last_drag_x = event.x
-        self.last_drag_y = event.y
+        self.last_drag_x, self.last_drag_y = e.x, e.y
         self.update_preview()
 
-    def stop_drag(self, event):
+    def stop_drag(self, e):
         self.dragging = False
 
-    def apply_and_save(self):
-        final_image = self.image_to_save.copy()
-        if self.crop_var.get() != "original":
-            h, w = final_image.shape[:2]
-            target_ratio = eval(self.crop_var.get().replace(':', '/'))
-            if w/h > target_ratio:
-                new_h, new_w = h, int(h * target_ratio)
+    def update_preview(self):
+        base = self.preview_img.copy()
+        pw, ph = base.size
+        ratio = parse_ratio(self.crop_var.get())
+
+        draw_img = base.convert("RGBA")
+        if ratio is not None:
+            overlay = Image.new("RGBA", (pw, ph), (0, 0, 0, 140))
+            if pw / ph > ratio:
+                crop_h = ph
+                crop_w = int(crop_h * ratio)
+                self.crop_x_offset_preview = max(0, min(self.crop_x_offset_preview, pw - crop_w))
+                x0 = int(self.crop_x_offset_preview)
+                overlay.paste((0,0,0,0), (x0, 0, x0 + crop_w, crop_h))
             else:
-                new_w, new_h = w, int(w / target_ratio)
+                crop_w = pw
+                crop_h = int(crop_w / ratio)
+                self.crop_y_offset_preview = max(0, min(self.crop_y_offset_preview, ph - crop_h))
+                y0 = int(self.crop_y_offset_preview)
+                overlay.paste((0,0,0,0), (0, y0, crop_w, y0 + crop_h))
+            draw_img = Image.alpha_composite(draw_img, overlay)
+
+        self.tk_prev = ImageTk.PhotoImage(draw_img.convert("RGB"))
+        self.canvas.delete("all")
+        self.canvas.config(width=pw, height=ph)
+        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_prev)
+
+    def apply(self):
+        ratio = parse_ratio(self.crop_var.get())
+        final = self.cv_image.copy()
+        if ratio is not None:
+            H, W = final.shape[:2]
+            if W / H > ratio:
+                new_h, new_w = H, int(H * ratio)
+            else:
+                new_w, new_h = W, int(W / ratio)
             crop_x = int(self.crop_x_offset_preview * self.scale_w)
             crop_y = int(self.crop_y_offset_preview * self.scale_h)
-            crop_x = max(0, min(crop_x, w - new_w))
-            crop_y = max(0, min(crop_y, h - new_h))
-            final_image = final_image[crop_y:crop_y+new_h, crop_x:crop_x+new_w]
+            crop_x = max(0, min(crop_x, W - new_w))
+            crop_y = max(0, min(crop_y, H - new_h))
+            final = final[crop_y:crop_y+new_h, crop_x:crop_x+new_w]
 
-        size_mode = self.size_var.get()
-        if size_mode != "original":
-            h, w = final_image.shape[:2]
-            aspect_ratio = w / h if h != 0 else 1.0
-            
-            target_w, target_h = 0, 0
-            if size_mode == "small": target_w = 854
-            elif size_mode == "medium": target_w = 1280
-            elif size_mode == "large": target_w = 1920
-            
-            # HATA DÜZELTMESİ: Özel boyut için en-boy oranı koruma mantığı
-            elif size_mode == "custom":
-                try:
-                    w_entry, h_entry = self.width_entry.get().strip(), self.height_entry.get().strip()
-                    if w_entry and h_entry:
-                        target_w, target_h = int(w_entry), int(h_entry)
-                    elif w_entry:
-                        target_w = int(w_entry)
-                        target_h = int(target_w / aspect_ratio) if aspect_ratio > 0 else 0
-                    elif h_entry:
-                        target_h = int(h_entry)
-                        target_w = int(target_h * aspect_ratio)
-                    else:
-                        messagebox.showerror("Hata", "Özel boyut için en az bir değer girmelisiniz.", parent=self.top)
-                        return
-                except ValueError:
-                    messagebox.showerror("Hata", "Özel boyut için geçerli sayılar girin.", parent=self.top)
-                    return
-            
-            if target_w != 0 and target_h == 0:
-                target_h = int(target_w / aspect_ratio) if aspect_ratio > 0 else 0
-
-            if target_w > 0 and target_h > 0:
-                final_image = cv2.resize(final_image, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-        # Dosya kaydetme diyaloğu... (devamı aynı)
-        original_filepath = filedialog.asksaveasfilename(
-            defaultextension=".jpg",
-            filetypes=[("JPG file", "*.jpg"), ("PNG file", "*.png"), ("BMP file", "*.bmp")]
-        )
-        if not original_filepath: return
-        
-        directory, filename_ext = os.path.split(original_filepath)
-        filename, ext = os.path.splitext(filename_ext)
-
-        modifications = []
-        crop_names = {"21:9": "manset", "16:9": "galeri", "4:3": "klasik", "1:1": "kare"}
-        if self.crop_var.get() != "original":
-            modifications.append(crop_names.get(self.crop_var.get(), self.crop_var.get()))
-        if self.size_var.get() != "original":
-            modifications.append(self.size_var.get())
-
-        new_filename = filename + ("_" + "_".join(modifications) if modifications else "")
-        filepath = os.path.join(directory, new_filename + ext)
-        
-        try:
-            if ext.lower() in ('.jpg', '.jpeg'):
-                cv2.imwrite(filepath, final_image, [cv2.IMWRITE_JPEG_QUALITY, self.quality_scale.get()])
-            else:
-                cv2.imwrite(filepath, final_image)
-            
-            messagebox.showinfo("Başarılı", f"Fotoğraf başarıyla kaydedildi:\n{os.path.normpath(filepath)}", parent=self.top)
-            self.top.destroy()
-        except Exception as e:
-            messagebox.showerror("Kaydetme Hatası", f"Bir hata oluştu: {e}", parent=self.top)
-
-
-# ==============================================================================
-# BÖLÜM 1.5: FİLİGRAN EKLEME DİYALOG PENCERESİ
-# (Bu sınıf önceki yanıttaki haliyle doğru ve değiştirilmedi)
-# ==============================================================================
-class WatermarkDialog:
-    # ... Önceki yanıtta verilen WatermarkDialog sınıfının kodu burada yer almalı ...
-    def __init__(self, parent, cv_image):
-        self.top = tk.Toplevel(parent)
-        self.top.title("Filigran Ekle")
-        self.top.transient(parent)
-        self.top.grab_set()
-        self.base_image_pil = Image.fromarray(cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGBA))
-        self.result_image = None
-        main_frame = tk.Frame(self.top, padx=15, pady=15)
-        main_frame.pack(expand=True, fill="both")
-        self.watermark_type = tk.StringVar(value="text")
-        type_frame = tk.LabelFrame(main_frame, text="1. Filigran Türü", padx=10, pady=10)
-        type_frame.pack(fill="x", pady=(0, 10))
-        tk.Radiobutton(type_frame, text="Metin Filigranı", variable=self.watermark_type, value="text", command=self.toggle_options).pack(anchor="w")
-        tk.Radiobutton(type_frame, text="Logo (Resim) Filigranı", variable=self.watermark_type, value="logo", command=self.toggle_options).pack(anchor="w")
-        self.text_frame = tk.LabelFrame(main_frame, text="2. Metin Ayarları", padx=10, pady=10)
-        self.text_frame.pack(fill="x", pady=5)
-        tk.Label(self.text_frame, text="Metin:").grid(row=0, column=0, sticky="w", pady=2)
-        self.text_entry = tk.Entry(self.text_frame, width=30)
-        self.text_entry.grid(row=0, column=1, columnspan=2, sticky="ew")
-        self.text_entry.insert(0, "* KVKK gereği bazı yüzler bulanıklaştırılmıştır.")
-        tk.Label(self.text_frame, text="Yazı Boyutu:").grid(row=1, column=0, sticky="w", pady=2)
-        self.font_size_entry = tk.Entry(self.text_frame, width=5)
-        self.font_size_entry.grid(row=1, column=1, sticky="w")
-        self.font_size_entry.insert(0, "14")
-        tk.Label(self.text_frame, text="Renk:").grid(row=2, column=0, sticky="w", pady=2)
-        self.color_button = tk.Button(self.text_frame, text="Renk Seç", command=self.choose_color)
-        self.color_button.grid(row=2, column=1, sticky="w")
-        self.text_color = (255, 255, 255)
-        self.logo_frame = tk.LabelFrame(main_frame, text="2. Logo Ayarları", padx=10, pady=10)
-        self.logo_path_var = tk.StringVar()
-        tk.Label(self.logo_frame, text="Logo Dosyası:").grid(row=0, column=0, sticky="w")
-        tk.Entry(self.logo_frame, textvariable=self.logo_path_var, state="readonly", width=30).grid(row=0, column=1, sticky="ew")
-        tk.Button(self.logo_frame, text="...", command=self.browse_logo).grid(row=0, column=2, padx=5)
-        tk.Label(self.logo_frame, text="Boyut (%):").grid(row=1, column=0, sticky="w", pady=5)
-        self.logo_size_scale = tk.Scale(self.logo_frame, from_=1, to=100, orient="horizontal", length=200)
-        self.logo_size_scale.set(5)
-        self.logo_size_scale.grid(row=1, column=1, columnspan=2, sticky="ew")
-        common_frame = tk.LabelFrame(main_frame, text="3. Ortak Ayarlar", padx=10, pady=10)
-        common_frame.pack(fill="x", pady=5)
-        tk.Label(common_frame, text="Konum:").grid(row=0, column=0, sticky="w")
-        self.position_var = tk.StringVar(value="bottom_right")
-        positions = {"Sağ Alt": "bottom_right", "Sol Alt": "bottom_left", "Sağ Üst": "top_right", "Sol Üst": "top_left", "Orta": "center"}
-        pos_col = 1
-        for text, value in positions.items():
-            tk.Radiobutton(common_frame, text=text, variable=self.position_var, value=value).grid(row=0, column=pos_col, sticky="w")
-            pos_col += 1
-        tk.Label(common_frame, text="Şeffaflık (%):").grid(row=1, column=0, sticky="w", pady=5)
-        self.opacity_scale = tk.Scale(common_frame, from_=0, to=100, orient="horizontal", length=300)
-        self.opacity_scale.set(40)
-        self.opacity_scale.grid(row=1, column=1, columnspan=len(positions), sticky="ew")
-        button_frame = tk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
-        tk.Button(button_frame, text="Uygula", command=self.apply, bg="#4CAF50", fg="white").pack(side="right", padx=5)
-        tk.Button(button_frame, text="İptal", command=self.top.destroy).pack(side="right")
-        self.toggle_options()
-    def toggle_options(self):
-        if self.watermark_type.get() == "text":
-            self.logo_frame.pack_forget()
-            self.text_frame.pack(fill="x", pady=5)
-        else:
-            self.text_frame.pack_forget()
-            self.logo_frame.pack(fill="x", pady=5)
-    def choose_color(self):
-        color_code = colorchooser.askcolor(title="Metin Rengi Seçin")
-        if color_code and color_code[0]: self.text_color = tuple(int(c) for c in color_code[0])
-    def browse_logo(self):
-        path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")])
-        if path: self.logo_path_var.set(path)
-    def apply(self):
-        base_image = self.base_image_pil.copy()
-        watermark_obj, ww, wh = None, 0, 0
-        if self.watermark_type.get() == "logo":
-            logo_path = self.logo_path_var.get()
-            if not logo_path: return messagebox.showerror("Hata", "Lütfen bir logo dosyası seçin.", parent=self.top)
-            try: logo = Image.open(logo_path).convert("RGBA")
-            except Exception as e: return messagebox.showerror("Hata", f"Logo açılamadı: {e}", parent=self.top)
-            size_percent = self.logo_size_scale.get()
-            target_width = int(base_image.width * (size_percent / 100))
-            ratio = target_width / logo.width
-            target_height = int(logo.height * ratio)
-            logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
-            logo_data = logo.getdata()
-            new_data = []
-            opacity_percent = self.opacity_scale.get() / 100
-            for item in logo_data:
-                new_alpha = int(item[3] * opacity_percent)
-                new_data.append((item[0], item[1], item[2], new_alpha))
-            logo.putdata(new_data)
-            watermark_obj = logo
-            ww, wh = watermark_obj.size
-        else:
-            text = self.text_entry.get()
-            if not text: return messagebox.showerror("Hata", "Lütfen filigran metnini girin.", parent=self.top)
-            try: font_size = int(self.font_size_entry.get())
-            except ValueError: return messagebox.showerror("Hata", "Yazı boyutu geçerli bir sayı olmalı.", parent=self.top)
-            try: font = ImageFont.truetype("arial.ttf", font_size)
-            except IOError: font = ImageFont.load_default()
-            draw = ImageDraw.Draw(base_image)
-            _, _, ww, wh = draw.textbbox((0, 0), text, font=font)
-            opacity = int(255 * (self.opacity_scale.get() / 100))
-            final_text_color = self.text_color + (opacity,)
-            watermark_obj = (text, font, final_text_color)
-        if watermark_obj is None: return
-        margin = 10
-        pos_choice = self.position_var.get()
-        if pos_choice == "top_left": position = (margin, margin)
-        elif pos_choice == "top_right": position = (base_image.width - ww - margin, margin)
-        elif pos_choice == "bottom_left": position = (margin, base_image.height - wh - margin)
-        elif pos_choice == "center": position = ((base_image.width - ww) // 2, (base_image.height - wh) // 2)
-        else: position = (base_image.width - ww - margin, base_image.height - wh - margin)
-        if self.watermark_type.get() == "logo":
-            base_image.paste(watermark_obj, position, mask=watermark_obj)
-            final_image_pil = base_image
-        else:
-            text, font, color = watermark_obj
-            txt_layer = Image.new("RGBA", base_image.size, (255, 255, 255, 0))
-            draw = ImageDraw.Draw(txt_layer)
-            draw.text(position, text, font=font, fill=color)
-            final_image_pil = Image.alpha_composite(base_image, txt_layer)
-        final_image_pil = final_image_pil.convert("RGB")
-        self.result_image = cv2.cvtColor(np.array(final_image_pil), cv2.COLOR_RGB2BGR)
+        # Kırpma tercihini kaydet
+        _write_config({"crop": {"ratio": self.crop_var.get()}})
+        self.result_image = final
         self.top.destroy()
 
 
 # ==============================================================================
-# BÖLÜM 2: ANA UYGULAMA PENCERESİ
+# FİLİGRAN/LOGO AYARLARI DİYALOĞU (Ayarları JSON'a yazar)
+# ==============================================================================
+class WatermarkSettingsDialog:
+    def __init__(self, parent):
+        self.top = tk.Toplevel(parent)
+        self.top.title("Filigran/Logo Ayarları")
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        cfg = _read_config()
+        wm = cfg.get("watermark", {})
+        self.enable_text = tk.BooleanVar(value=wm.get("enable_text", True))
+        self.enable_logo = tk.BooleanVar(value=wm.get("enable_logo", True))
+        self.text = tk.StringVar(value=wm.get("text", "* KVKK gereği bazı yüzler bulanıklaştırılmıştır."))
+        self.text_size_percent = tk.IntVar(value=int(wm.get("text_size_percent", 2)))
+        self.opacity = tk.IntVar(value=int(wm.get("opacity", 40)))
+        color = wm.get("color", [255, 255, 255])
+        self.text_color = (int(color[0]), int(color[1]), int(color[2]))
+        self.logo_path = tk.StringVar(value=wm.get("logo_path", ""))
+        self.logo_size_percent = tk.IntVar(value=int(wm.get("logo_size_percent", 15)))
+
+        main = tk.Frame(self.top, padx=12, pady=12)
+        main.pack(expand=True, fill="both")
+
+        # Metin
+        tf = tk.LabelFrame(main, text="Metin", padx=8, pady=8)
+        tf.pack(fill="x", pady=(0,8))
+        tk.Checkbutton(tf, text="Metin ekle", variable=self.enable_text).grid(row=0, column=0, sticky="w", pady=2, columnspan=2)
+        tk.Label(tf, text="İçerik:").grid(row=1, column=0, sticky="w")
+        tk.Entry(tf, textvariable=self.text, width=40).grid(row=1, column=1, sticky="ew", padx=(6,0))
+        tk.Label(tf, text="Boyut (% yükseklik):").grid(row=2, column=0, sticky="w", pady=4)
+        tk.Scale(tf, from_=1, to=15, orient="horizontal", variable=self.text_size_percent, length=220).grid(row=2, column=1, sticky="w")
+        tk.Label(tf, text="Renk:").grid(row=3, column=0, sticky="w")
+        tk.Button(tf, text="Renk Seç", command=self.choose_color).grid(row=3, column=1, sticky="w", padx=(6,0))
+
+        # Logo
+        lf = tk.LabelFrame(main, text="Logo", padx=8, pady=8)
+        lf.pack(fill="x", pady=(0,8))
+        tk.Checkbutton(lf, text="Logo ekle", variable=self.enable_logo).grid(row=0, column=0, sticky="w", pady=2, columnspan=3)
+        tk.Label(lf, text="Dosya:").grid(row=1, column=0, sticky="w")
+        tk.Entry(lf, textvariable=self.logo_path, state="readonly", width=35).grid(row=1, column=1, sticky="ew")
+        tk.Button(lf, text="...", command=self.browse_logo).grid(row=1, column=2, padx=5)
+        tk.Label(lf, text="Boyut (% genişlik):").grid(row=2, column=0, sticky="w", pady=4)
+        tk.Scale(lf, from_=1, to=100, orient="horizontal", variable=self.logo_size_percent, length=220).grid(row=2, column=1, sticky="w", columnspan=2)
+
+        # Ortak
+        cf = tk.LabelFrame(main, text="Ortak", padx=8, pady=8)
+        cf.pack(fill="x", pady=(0,8))
+        tk.Label(cf, text="Şeffaflık (%):").grid(row=0, column=0, sticky="w")
+        tk.Scale(cf, from_=0, to=100, orient="horizontal", variable=self.opacity, length=220).grid(row=0, column=1, sticky="w")
+
+        # Alt butonlar
+        bf = tk.Frame(main)
+        bf.pack(fill="x", pady=(8,0))
+        tk.Button(bf, text="Kaydet", bg="#4CAF50", fg="white", command=self.save).pack(side="right", padx=5)
+        tk.Button(bf, text="İptal", command=self.top.destroy).pack(side="right")
+
+    def choose_color(self):
+        c = colorchooser.askcolor(title="Metin Rengi Seçin")
+        if c and c[0]:
+            self.text_color = tuple(int(v) for v in c[0])
+
+    def browse_logo(self):
+        p = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")])
+        if p:
+            self.logo_path.set(p)
+            # Logo yolu anında kalıcı olsun (istenen davranış)
+            _write_config({"watermark": {"logo_path": p}})
+
+    def save(self):
+        patch = {
+            "watermark": {
+                "enable_text": bool(self.enable_text.get()),
+                "enable_logo": bool(self.enable_logo.get()),
+                "text": self.text.get().strip(),
+                "text_size_percent": int(self.text_size_percent.get()),
+                "color": [int(self.text_color[0]), int(self.text_color[1]), int(self.text_color[2])],
+                "opacity": int(self.opacity.get()),
+                "logo_path": self.logo_path.get(),
+                "logo_size_percent": int(self.logo_size_percent.get()),
+                # pozisyon sabit: metin sağ alt, logo merkez (istenen davranış)
+            }
+        }
+        _write_config(patch)
+        self.top.destroy()
+
+
+# ==============================================================================
+# ANA UYGULAMA (ID Photos Pro benzeri adım mantığı)
 # ==============================================================================
 class ImageToolApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Miflon - Görsel Araç Seti")
-        
+
         screen_width = int(root.winfo_screenwidth() * 0.9)
         screen_height = int(root.winfo_screenheight() * 0.9)
         x_pos = (root.winfo_screenwidth() - screen_width) // 2
         y_pos = (root.winfo_screenheight() - screen_height) // 2
         self.root.geometry(f"{screen_width}x{screen_height}+{x_pos}+{y_pos}")
-        self.root.minsize(800, 600)
-        
+        self.root.minsize(900, 620)
+
+        # Durum
         self.cv_image, self.tk_image, self.selection_rect = None, None, None
         self.start_x, self.start_y = 0, 0
         self.image_offset_x, self.image_offset_y = 0, 0
         self.display_image_w, self.display_image_h = 1, 1
 
+        # Batch (çoklu dosya)
+        self.batch_files = []
+        self.batch_index = -1
+
+        # Tuval
         self.canvas = tk.Canvas(root, cursor="cross", bg='gray20')
         self.canvas.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        btn_frame = tk.Frame(root)
-        btn_frame.pack(fill="x", side="bottom", pady=5)
-        
-        self.btn_open = tk.Button(btn_frame, text="Fotoğraf Aç", command=self.open_image)
-        self.btn_open.pack(side="left", padx=10, pady=5)
-        
-        # DEĞİŞTİRİLDİ: Ayarların kaydedilmesi/yüklenmesi için Tkinter değişkenleri kullanılıyor
-        self.effect_type = tk.StringVar(value="blur")
-        self.selection_type = tk.StringVar(value="oval")
-        self.blur_value = tk.IntVar(value=19)
-        self.pixel_value = tk.IntVar(value=7)
 
-        effect_frame = tk.LabelFrame(btn_frame, text="Efekt")
-        effect_frame.pack(side="left", padx=5, pady=5)
-        tk.Radiobutton(effect_frame, text="Blur", variable=self.effect_type, value="blur").pack(side="left")
-        tk.Radiobutton(effect_frame, text="Pixel", variable=self.effect_type, value="pixel").pack(side="left")
+        # Step bar (ID Photos Pro benzeri: soldan sağa adımlar)
+        step = tk.Frame(root)
+        step.pack(fill="x", side="bottom", pady=6)
 
-        self.blur_scale = tk.Scale(btn_frame, from_=3, to=99, orient="horizontal", label="Blur Şiddeti", resolution=2, length=150, variable=self.blur_value)
-        self.blur_scale.pack(side="left", padx=5, pady=5)
+        self.btn_open = tk.Button(step, text="1) Fotoğraf Aç", command=self.open_images)
+        self.btn_open.pack(side="left", padx=8)
 
-        self.pixel_scale = tk.Scale(btn_frame, from_=2, to=50, orient="horizontal", label="Pixel Boyutu", length=150, variable=self.pixel_value)
-        self.pixel_scale.pack(side="left", padx=5, pady=5)
-        
-        selection_frame = tk.LabelFrame(btn_frame, text="Seçim Şekli")
-        selection_frame.pack(side="left", padx=5, pady=5)
-        tk.Radiobutton(selection_frame, text="Kare", variable=self.selection_type, value="rectangle").pack(side="left")
-        tk.Radiobutton(selection_frame, text="Yuvarlak", variable=self.selection_type, value="oval").pack(side="left")
-        
-        self.btn_watermark = tk.Button(btn_frame, text="Filigran Ekle...", command=self.show_watermark_dialog, state="disabled")
-        self.btn_watermark.pack(side="left", padx=10)
+        # Efekt/Seçim (2. adım)
+        fx = tk.LabelFrame(step, text="2) Bulanıklaştırma/Piksel", padx=6, pady=4)
+        fx.pack(side="left", padx=6)
+        self.effect_type = tk.StringVar(value=_read_config().get("app", {}).get("effect_type", "blur"))
+        self.selection_type = tk.StringVar(value=_read_config().get("app", {}).get("selection_type", "oval"))
+        self.blur_value = tk.IntVar(value=int(_read_config().get("app", {}).get("blur_value", 19)))
+        self.pixel_value = tk.IntVar(value=int(_read_config().get("app", {}).get("pixel_value", 7)))
+        self.feather_value = tk.IntVar(value=int(_read_config().get("app", {}).get("feather_value", 8)))
 
-        right_btn_frame = tk.Frame(btn_frame)
-        right_btn_frame.pack(side="right", padx=10)
-        self.btn_save = tk.Button(right_btn_frame, text="Kaydet...", command=self.show_save_options, state="disabled")
-        self.btn_save.pack(fill="x")
-        self.btn_undo = tk.Button(right_btn_frame, text="Geri Al (Ctrl+Z)", command=self.undo, state="disabled")
-        self.btn_undo.pack(fill="x", pady=5)
+        tk.Radiobutton(fx, text="Blur", variable=self.effect_type, value="blur").pack(side="left")
+        tk.Radiobutton(fx, text="Pixel", variable=self.effect_type, value="pixel").pack(side="left")
+        tk.Scale(fx, from_=3, to=99, orient="horizontal", label="Blur", resolution=2, length=120, variable=self.blur_value).pack(side="left", padx=4)
+        tk.Scale(fx, from_=2, to=50, orient="horizontal", label="Pixel", length=120, variable=self.pixel_value).pack(side="left", padx=4)
+        tk.Label(fx, text="Seçim:").pack(side="left", padx=(6,0))
+        tk.Radiobutton(fx, text="Kare", variable=self.selection_type, value="rectangle").pack(side="left")
+        tk.Radiobutton(fx, text="Oval", variable=self.selection_type, value="oval").pack(side="left")
+        tk.Scale(fx, from_=0, to=50, orient="horizontal", label="Kenar Yumuşatma", length=140, variable=self.feather_value).pack(side="left", padx=4)
 
+        # 3) Kırp
+        self.btn_crop = tk.Button(step, text="3) Kırp...", command=self.open_crop, state="disabled")
+        self.btn_crop.pack(side="left", padx=8)
+
+        # 4) Filigran
+        self.btn_wm_settings = tk.Button(step, text="4) Filigran Ayarları...", command=self.open_wm_settings, state="disabled")
+        self.btn_wm_settings.pack(side="left", padx=4)
+        self.btn_apply_wm = tk.Button(step, text="Filigran ve Logo Ekle", command=self.apply_wm_logo_now, state="disabled")
+        self.btn_apply_wm.pack(side="left", padx=4)
+
+        # 5) Kaydet
+        self.btn_save = tk.Button(step, text="5) Kaydet...", command=self.save_current, state="disabled")
+        self.btn_save.pack(side="left", padx=8)
+
+        # Sağ tarafta geri al
+        right = tk.Frame(step)
+        right.pack(side="right", padx=8)
+        self.btn_undo = tk.Button(right, text="Geri Al (Ctrl+Z)", command=self.undo, state="disabled")
+        self.btn_undo.pack()
+
+        # Undo
         self.history, self.current_step = [], -1
+        self.max_history = 20
 
+        # Olaylar
         self.canvas.bind("<ButtonPress-1>", self.on_button_press)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
         self.root.bind('<Configure>', self.on_window_resize)
         self.root.bind('<Control-z>', self.undo)
 
-        # YENİ: Ayarları yükle ve kapanırken kaydetme protokolünü ayarla
-        self.load_settings()
+        # Pencere kapanışı
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    # YENİ: Ayarları yükleme fonksiyonu
-    def load_settings(self):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                settings = json.load(f)
-                self.effect_type.set(settings.get("effect_type", "blur"))
-                self.selection_type.set(settings.get("selection_type", "oval"))
-                self.blur_value.set(settings.get("blur_value", 19))
-                self.pixel_value.set(settings.get("pixel_value", 7))
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass # Dosya yoksa veya bozuksa varsayılan değerler kalır, hata vermeye gerek yok.
+    # ----- Genel ayarlar kaydet -----
+    def save_app_settings(self):
+        _write_config({
+            "app": {
+                "effect_type": self.effect_type.get(),
+                "selection_type": self.selection_type.get(),
+                "blur_value": int(self.blur_value.get()),
+                "pixel_value": int(self.pixel_value.get()),
+                "feather_value": int(self.feather_value.get()),
+            }
+        })
 
-    # YENİ: Ayarları kaydetme fonksiyonu
-    def save_settings(self):
-        settings = {
-            "effect_type": self.effect_type.get(),
-            "selection_type": self.selection_type.get(),
-            "blur_value": self.blur_value.get(),
-            "pixel_value": self.pixel_value.get(),
-        }
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(settings, f, indent=4)
-
-    # YENİ: Pencere kapatılırken çağrılacak fonksiyon
     def on_closing(self):
-        self.save_settings()
+        self.save_app_settings()
         self.root.destroy()
-    
-    # ... (Geri kalan ImageToolApp metodları aynı kalacak) ...
+
+    # ----- Batch/Fotoğraf yükleme -----
+    def open_images(self):
+        files = filedialog.askopenfilenames(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
+        if not files:
+            return
+        self.batch_files = list(files)
+        self.batch_index = 0
+        self.load_image_from_path(self.batch_files[self.batch_index])
+
+    def load_image_from_path(self, filepath):
+        try:
+            pil_image = Image.open(filepath)
+            if pil_image.mode == 'RGBA':
+                self.cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGBA2BGR)
+            else:
+                self.cv_image = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
+
+            self.update_window_title(filepath)
+            self.history = []
+            self.current_step = -1
+            self.add_to_history(self.cv_image)
+            self.update_display_image()
+
+            # Adım butonlarını aktif et
+            self.btn_crop.config(state="normal")
+            self.btn_wm_settings.config(state="normal")
+            self.btn_apply_wm.config(state="normal")
+            self.btn_save.config(state="normal")
+            self.btn_undo.config(state="disabled")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Resim açılırken hata oluştu: {str(e)}")
+
+    def after_save_flow(self):
+        if self.batch_files and 0 <= self.batch_index < len(self.batch_files) - 1:
+            self.batch_index += 1
+            self.load_image_from_path(self.batch_files[self.batch_index])
+            messagebox.showinfo("Sıradaki Fotoğraf", f"Kaydedildi. ({self.batch_index + 1}/{len(self.batch_files)}) sıradaki fotoğraf yüklendi.")
+        else:
+            self.reset_to_initial_state()
+            messagebox.showinfo("Bitti", "Kaydetme tamamlandı. Yeni bir fotoğraf açabilirsiniz.")
+
+    def reset_to_initial_state(self):
+        self.cv_image = None
+        self.history, self.current_step = [], -1
+        self.canvas.delete("all")
+        self.update_window_title(None)
+        self.btn_crop.config(state="disabled")
+        self.btn_wm_settings.config(state="disabled")
+        self.btn_apply_wm.config(state="disabled")
+        self.btn_save.config(state="disabled")
+        self.btn_undo.config(state="disabled")
+        self.batch_files = []
+        self.batch_index = -1
+
+    # ----- Undo -----
     def add_to_history(self, image_state):
         if self.current_step < len(self.history) - 1:
             self.history = self.history[:self.current_step + 1]
         self.history.append(image_state.copy())
-        self.current_step += 1
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+        self.current_step = len(self.history) - 1
         self.btn_undo.config(state="normal")
-    
+
     def undo(self, event=None):
         if self.current_step > 0:
             self.current_step -= 1
@@ -528,6 +459,7 @@ class ImageToolApp:
             if self.current_step == 0:
                 self.btn_undo.config(state="disabled")
 
+    # ----- UI yardımcıları -----
     def update_window_title(self, filepath=None):
         base_title = "Miflon - Görsel Araç Seti"
         if filepath:
@@ -535,138 +467,261 @@ class ImageToolApp:
         else:
             self.root.title(base_title)
 
-    def open_image(self):
-        filepath = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp")])
-        if not filepath: return
-        try:
-            pil_image = Image.open(filepath)
-            if pil_image.mode == 'RGBA':
-                self.cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGBA2BGR)
-            else:
-                self.cv_image = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
-            
-            self.update_window_title(filepath)
-            self.history = []
-            self.current_step = -1
-            self.add_to_history(self.cv_image)
-            self.update_display_image()
-            self.btn_save.config(state="normal")
-            self.btn_watermark.config(state="normal")
-            self.btn_undo.config(state="disabled")
-        except Exception as e:
-            messagebox.showerror("Hata", f"Resim açılırken hata oluştu: {str(e)}")
-        
     def on_window_resize(self, event=None):
         if self.cv_image is not None:
             self.update_display_image()
-            
+
     def update_display_image(self):
-        if self.cv_image is None: return
+        if self.cv_image is None:
+            return
         image_rgb = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
-        
+
         canvas_width, canvas_height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if canvas_width < 10 or canvas_height < 10: return
-        
+        if canvas_width < 10 or canvas_height < 10:
+            return
+
         img_ratio = pil_image.width / pil_image.height if pil_image.height > 0 else 1
         canvas_ratio = canvas_width / canvas_height if canvas_height > 0 else 1
-        
+
         if img_ratio > canvas_ratio:
-            new_width = canvas_width - 10
-            new_height = int(new_width / img_ratio)
+            new_width = max(1, canvas_width - 10)
+            new_height = max(1, int(new_width / img_ratio))
         else:
-            new_height = canvas_height - 10
-            new_width = int(new_height * img_ratio)
-        
+            new_height = max(1, canvas_height - 10)
+            new_width = max(1, int(new_height * img_ratio))
+
         resized_pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
+
         self.display_image_w, self.display_image_h = resized_pil_image.size
         self.tk_image = ImageTk.PhotoImage(resized_pil_image)
-        
+
         self.canvas.delete("all")
         self.image_offset_x = (canvas_width - self.display_image_w) // 2
         self.image_offset_y = (canvas_height - self.display_image_h) // 2
         self.canvas.create_image(self.image_offset_x, self.image_offset_y, anchor="nw", image=self.tk_image)
 
+    # ----- Seçim ve efekt (2. adım) -----
     def on_button_press(self, event):
         self.start_x = self.canvas.canvasx(event.x)
         self.start_y = self.canvas.canvasy(event.y)
-        if self.selection_rect: self.canvas.delete(self.selection_rect)
+        if self.selection_rect:
+            self.canvas.delete(self.selection_rect)
 
     def on_mouse_drag(self, event):
+        if self.cv_image is None:
+            return
         cur_x, cur_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        if self.selection_rect: self.canvas.delete(self.selection_rect)
+        if self.selection_rect:
+            self.canvas.delete(self.selection_rect)
         shape_method = self.canvas.create_oval if self.selection_type.get() == "oval" else self.canvas.create_rectangle
         self.selection_rect = shape_method(self.start_x, self.start_y, cur_x, cur_y, outline='red', width=2)
 
     def on_button_release(self, event):
         if self.cv_image is not None and self.start_x is not None:
             end_x, end_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-            if self.selection_rect: self.canvas.delete(self.selection_rect); self.selection_rect = None
+            if self.selection_rect:
+                self.canvas.delete(self.selection_rect)
+                self.selection_rect = None
             self.apply_effect_to_selection(self.start_x, self.start_y, end_x, end_y)
             self.start_x, self.start_y = None, None
-            
+            self.save_app_settings()
+
     def apply_pixelate(self, img, pixel_size):
         h, w = img.shape[:2]
-        if w < pixel_size or h < pixel_size or pixel_size <= 0: return img
-        temp = cv2.resize(img, (w // pixel_size, h // pixel_size), interpolation=cv2.INTER_LINEAR)
-        return cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
+        if w < pixel_size or h < pixel_size or pixel_size <= 0:
+            return img
+        small = cv2.resize(img, (max(1, w // pixel_size), max(1, h // pixel_size)), interpolation=cv2.INTER_AREA)
+        return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
     def apply_effect_to_selection(self, start_x, start_y, end_x, end_y):
         x1, y1 = min(start_x, end_x) - self.image_offset_x, min(start_y, end_y) - self.image_offset_y
         x2, y2 = max(start_x, end_x) - self.image_offset_x, max(start_y, end_y) - self.image_offset_y
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(self.display_image_w, x2), min(self.display_image_h, y2)
-        if (x2 - x1) <= 0 or (y2 - y1) <= 0: return
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(self.display_image_w, int(x2)), min(self.display_image_h, int(y2))
+        if (x2 - x1) < 3 or (y2 - y1) < 3:
+            return
 
         h_orig, w_orig = self.cv_image.shape[:2]
         w_ratio = w_orig / self.display_image_w if self.display_image_w > 0 else 1
         h_ratio = h_orig / self.display_image_h if self.display_image_h > 0 else 1
-        
+
         x1_orig, x2_orig = int(x1 * w_ratio), int(x2 * w_ratio)
         y1_orig, y2_orig = int(y1 * h_ratio), int(y2 * h_ratio)
-        
+
         image_copy = self.cv_image.copy()
         roi_original = image_copy[y1_orig:y2_orig, x1_orig:x2_orig]
-        if roi_original.size == 0: return
-        
+        if roi_original.size == 0:
+            return
+
         if self.effect_type.get() == "blur":
-            k = self.blur_value.get(); k = k if k % 2 == 1 else k + 1
+            k = int(self.blur_value.get()); k = k if k % 2 == 1 else k + 1
             processed_roi = cv2.GaussianBlur(roi_original, (k, k), 0)
         else:
-            processed_roi = self.apply_pixelate(roi_original, self.pixel_value.get())
+            processed_roi = self.apply_pixelate(roi_original, int(self.pixel_value.get()))
 
+        mask = np.zeros(roi_original.shape[:2], dtype=np.uint8)
         if self.selection_type.get() == "oval":
-            mask = np.zeros(roi_original.shape[:2], dtype=np.uint8)
-            center = (roi_original.shape[1]//2, roi_original.shape[0]//2)
-            axes = (roi_original.shape[1]//2, roi_original.shape[0]//2)
+            center = (roi_original.shape[1] // 2, roi_original.shape[0] // 2)
+            axes = (roi_original.shape[1] // 2, roi_original.shape[0] // 2)
             cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-            final_roi = np.where(mask[..., np.newaxis] == 255, processed_roi, roi_original)
         else:
-            final_roi = processed_roi
-            
+            mask[:] = 255
+
+        feather = int(self.feather_value.get())
+        if feather > 0:
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=feather, sigmaY=feather)
+
+        mask_f = (mask.astype(np.float32) / 255.0)[..., None]
+        final_roi = (processed_roi.astype(np.float32) * mask_f + roi_original.astype(np.float32) * (1 - mask_f)).astype(np.uint8)
+
         image_copy[y1_orig:y2_orig, x1_orig:x2_orig] = final_roi
         self.cv_image = image_copy
         self.add_to_history(self.cv_image)
         self.update_display_image()
 
-    def show_save_options(self):
-        if self.cv_image is not None:
-            SaveOptionsDialog(self.root, self.cv_image)
-
-    def show_watermark_dialog(self):
-        if self.cv_image is None: return
-        dialog = WatermarkDialog(self.root, self.cv_image)
-        self.root.wait_window(dialog.top)
-        if dialog.result_image is not None:
-            self.cv_image = dialog.result_image
+    # ----- 3) Kırp -----
+    def open_crop(self):
+        if self.cv_image is None:
+            return
+        dlg = CropDialog(self.root, self.cv_image)
+        self.root.wait_window(dlg.top)
+        if dlg.result_image is not None:
+            self.cv_image = dlg.result_image
             self.add_to_history(self.cv_image)
             self.update_display_image()
-            messagebox.showinfo("Başarılı", "Filigran başarıyla uygulandı.")
+            messagebox.showinfo("Kırpma", "Kırpma uygulandı.")
+
+    # ----- 4) Filigran -----
+    def open_wm_settings(self):
+        WatermarkSettingsDialog(self.root)
+
+    def _load_font(self, size):
+        for fp in ["arial.ttf", "DejaVuSans.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf"]:
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def _measure_text(self, draw, text, font):
+        try:
+            l, t, r, b = draw.textbbox((0, 0), text, font=font)
+            return r - l, b - t
+        except Exception:
+            try:
+                return draw.textsize(text, font=font)
+            except Exception:
+                return len(text) * font.size, font.size
+
+    def apply_wm_logo_now(self):
+        if self.cv_image is None:
+            return
+        cfg = _read_config()
+        wm = cfg.get("watermark", {})
+        enable_text = wm.get("enable_text", True)
+        enable_logo = wm.get("enable_logo", True)
+        text = wm.get("text", "* KVKK gereği bazı yüzler bulanıklaştırılmıştır.").strip()
+        text_size_pct = int(wm.get("text_size_percent", 2))
+        opacity = int(wm.get("opacity", 40))
+        color = wm.get("color", [255, 255, 255])
+        text_color = (int(color[0]), int(color[1]), int(color[2]))
+        logo_path = wm.get("logo_path", "")
+        logo_size_pct = int(wm.get("logo_size_percent", 15))
+
+        base = Image.fromarray(cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)).convert("RGBA")
+        w, h = base.size
+        layer = Image.new("RGBA", (w, h), (0,0,0,0))
+
+        # Logo ortada
+        if enable_logo and logo_path and os.path.isfile(logo_path):
+            try:
+                logo = Image.open(logo_path).convert("RGBA")
+                target_w = max(1, int(w * (logo_size_pct / 100.0)))
+                ratio = target_w / logo.width
+                target_h = max(1, int(logo.height * ratio))
+                logo = logo.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                if opacity < 100:
+                    data = np.array(logo)
+                    data[..., 3] = (data[..., 3].astype(np.float32) * (opacity/100.0)).astype(np.uint8)
+                    logo = Image.fromarray(data, mode="RGBA")
+                lw, lh = logo.size
+                pos = ((w - lw)//2, (h - lh)//2)  # merkez
+                layer.paste(logo, pos, mask=logo)
+            except Exception as e:
+                messagebox.showwarning("Logo", f"Logo uygulanamadı: {e}")
+
+        # Metin sağ alt
+        if enable_text and text:
+            draw = ImageDraw.Draw(layer)
+            desired_h = max(8, int(h * (text_size_pct / 100.0)))
+            font_size = max(8, desired_h)
+            font = self._load_font(font_size)
+            tw, th = self._measure_text(draw, text, font)
+            # genişliğe sığdır
+            max_w = int(w * 0.94)
+            if tw > max_w and tw > 0:
+                scale = max_w / tw
+                font_size = max(8, int(font_size * scale))
+                font = self._load_font(font_size)
+                tw, th = self._measure_text(draw, text, font)
+            col = (text_color[0], text_color[1], text_color[2], int(255 * (opacity/100.0)))
+            margin = 12
+            pos = (w - tw - margin, h - th - margin)  # sağ alt
+            draw.text(pos, text, font=font, fill=col)
+
+        final_pil = Image.alpha_composite(base, layer).convert("RGB")
+        self.cv_image = cv2.cvtColor(np.array(final_pil), cv2.COLOR_RGB2BGR)
+        self.add_to_history(self.cv_image)
+        self.update_display_image()
+        messagebox.showinfo("Filigran", "Filigran ve logo uygulandı.")
+
+    # ----- 5) Kaydet -----
+    def save_current(self):
+        if self.cv_image is None:
+            return
+        cfg = _read_config()
+        jpg_q = int(cfg.get("save", {}).get("jpg_quality", 95))
+
+        # Basit bir kalite seçici
+        qtop = tk.Toplevel(self.root)
+        qtop.title("Kaydet")
+        qtop.transient(self.root)
+        qtop.grab_set()
+        tk.Label(qtop, text="JPG Kalitesi:").pack(padx=12, pady=(12, 2))
+        qvar = tk.IntVar(value=jpg_q)
+        tk.Scale(qtop, from_=50, to=100, orient="horizontal", variable=qvar, length=260).pack(padx=12, pady=(0,12))
+        btnf = tk.Frame(qtop)
+        btnf.pack(fill="x", padx=12, pady=(0,12))
+        def do_save():
+            _write_config({"save": {"jpg_quality": int(qvar.get())}})
+            qtop.destroy()
+            self._save_dialog_and_next(int(qvar.get()))
+        tk.Button(btnf, text="Kaydet...", bg="#4CAF50", fg="white", command=do_save).pack(side="right", padx=5)
+        tk.Button(btnf, text="İptal", command=qtop.destroy).pack(side="right")
+
+    def _save_dialog_and_next(self, jpg_quality):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".jpg",
+            filetypes=[("JPG file", "*.jpg;*.jpeg"), ("PNG file", "*.png"), ("BMP file", "*.bmp")]
+        )
+        if not filepath:
+            return
+        ext = os.path.splitext(filepath)[1].lower()
+        try:
+            if ext in (".jpg", ".jpeg"):
+                cv2.imwrite(filepath, self.cv_image, [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)])
+            else:
+                cv2.imwrite(filepath, self.cv_image)
+            messagebox.showinfo("Kaydedildi", f"Fotoğraf kaydedildi:\n{os.path.normpath(filepath)}")
+            self.after_save_flow()
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kaydetme hatası: {e}")
+            return
 
 
 # ==============================================================================
-# BÖLÜM 3: UYGULAMAYI BAŞLATMA
+# Uygulamayı başlat
 # ==============================================================================
 if __name__ == "__main__":
     root = tk.Tk()
